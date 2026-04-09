@@ -150,7 +150,10 @@ export PATH=$DIRNAME/pd_setup_files/:$PATH
 
 ELTORITOISO=/tmp/puredarwin_eltorito_$$.iso
 
-EXT=$(basename "$1" | awk -F '.' '{print $2}')
+EXT="${1##*.}"
+# For names without a dot (e.g. a bare device path), EXT equals the full name;
+# reset it to empty to match the physical-disk branch behaviour.
+[ "$EXT" = "$1" ] && EXT=""
 
 # Loop-device and partition mapper state (for cleanup)
 export LOOP_DEV=""
@@ -754,10 +757,13 @@ mkdir -p "$MOUNT/var/db/dslocal/nodes/Default/users"
 
 if [ ! "$ADD_DEFAULT_USER" = "n" ]; then
     echo "Creating default user (toor:toor)"
-    # pd_injectuser is a Darwin shell script; we can run it directly here
-    # because it only manipulates plist files with standard tools.
+    # pd_injectuser is a shell script, but the Darwin binaries it calls
+    # (dscl, passwd, etc.) are Mach-O executables that cannot run on Linux.
+    # The chroot will fail on Linux; the user must be created on first boot
+    # inside the Darwin environment or via a pre-seeded plist instead.
     chroot "$MOUNT" /usr/local/share/puredarwin/scripts/pd_injectuser / toor 2>/dev/null || \
-        echo "  WARNING: pd_injectuser failed (chroot of Darwin binary on Linux; user may need to be created on first boot)"
+        echo "  NOTE: User creation skipped on Linux (Darwin Mach-O tools not available)."
+    echo "  The default user (toor/toor) must be created on first Darwin boot."
 fi
 
 ################################################################################
@@ -887,8 +893,8 @@ losetup -d "$LOOP_DEV" 2>/dev/null || true
 LOOP_DEV=""
 LOOP_PART=""
 
-# Determine output extension
-T_TARGET_EXT=$(basename "$TARGET" | awk -F '.' '{print $NF}')
+# Determine output extension (same as $EXT above, re-derived for clarity)
+T_TARGET_EXT="$EXT"
 
 if [ "$DARWIN_RELEASE" = "10" ]; then
     T_GUESTOS="darwin10"
