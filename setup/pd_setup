@@ -740,6 +740,19 @@ cd ${MOUNT}
 mkdir -p ./private/var/log/
 echo "Installing packages on '${MOUNT}'..."
 
+if [ -n "$PREBUILT_FILESYSTEM" ]; then
+	###########################################################################
+	# PREBUILT FILESYSTEM MODE
+	###########################################################################
+	# Copy the prebuilt filesystem tree directly instead of unpacking roots.
+	# Edit files under $PREBUILT_FILESYSTEM on your host, then re-run pd_setup
+	# to produce a fresh image with your changes.
+	echo "Using prebuilt filesystem from: $PREBUILT_FILESYSTEM"
+	ditto "$PREBUILT_FILESYSTEM" "${MOUNT}"
+else
+	###########################################################################
+	# STANDARD BINARY ROOTS MODE
+	###########################################################################
 for PROJECT in `cat $DIRNAME/$BINARYROOTS_LIST_FILE` ; do
 	echo " * $(basename $PROJECT.root.tar.bz2)"
 
@@ -1065,6 +1078,7 @@ if [ "$ADD_MACFUSE" = "y" ]; then
 
 fi
 
+fi # end of PREBUILT_FILESYSTEM / standard roots mode
 
 cd - > /dev/null
 

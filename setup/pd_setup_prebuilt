@@ -1,0 +1,65 @@
+#!/bin/sh
+#
+# pd_setup_prebuilt - convenience wrapper for building a PureDarwin image
+#                     from a prebuilt/extracted filesystem directory.
+#
+# Usage:
+#   ./pd_setup_prebuilt <prebuilt_dir> <output> <VolumeName>
+#
+#   <prebuilt_dir>  Path to an already-assembled Darwin filesystem root.
+#                   This is the directory that contains bin/, sbin/, usr/,
+#                   System/, private/, mach_kernel, etc.
+#                   Example: ../extracted/filesystem/PureDarwinXmas
+#
+#   <output>        Target output (same as pd_setup's $1):
+#                     puredarwin.vmwarevm  - VMware virtual machine
+#                     puredarwin.vmdk      - VMware virtual disk
+#                     puredarwin.iso       - ISO image
+#                     /Volumes/PureDarwin  - physical disk volume
+#
+#   <VolumeName>    HFS+ volume label (same as pd_setup's $2)
+#
+# Examples:
+#   ./pd_setup_prebuilt ../extracted/filesystem/PureDarwinXmas puredarwin.vmwarevm PureDarwin
+#   ./pd_setup_prebuilt ../extracted/filesystem/PureDarwinXmas puredarwin.iso PureDarwin
+#   ./pd_setup_prebuilt /Volumes/mymod puredarwin.vmwarevm PureDarwin
+#
+# To make a modified image:
+#   1. Edit files under <prebuilt_dir> on your Mac
+#   2. Run this script
+#   3. Open the resulting .vmwarevm in VMware Fusion to test
+#
+
+DIRNAME=$(cd $(dirname $0) && pwd)
+
+if [ "$1" = "" ] || [ "$2" = "" ] || [ "$3" = "" ]; then
+    echo "Usage: $(basename $0) <prebuilt_dir> <output> <VolumeName>"
+    echo ""
+    echo "Example:"
+    echo "  $(basename $0) ../extracted/filesystem/PureDarwinXmas puredarwin.vmwarevm PureDarwin"
+    exit 1
+fi
+
+PREBUILT_DIR="$1"
+OUTPUT="$2"
+VOLNAME="$3"
+
+if [ ! -d "$PREBUILT_DIR" ]; then
+    echo "ERROR: Prebuilt directory not found: $PREBUILT_DIR"
+    exit 1
+fi
+
+if [ ! -e "$PREBUILT_DIR/mach_kernel" ] && [ ! -e "$PREBUILT_DIR/mach_kernel.voodoo" ]; then
+    echo "WARNING: No mach_kernel found in $PREBUILT_DIR - are you sure this is a Darwin root?"
+fi
+
+echo "Prebuilt filesystem : $PREBUILT_DIR"
+echo "Output target       : $OUTPUT"
+echo "Volume name         : $VOLNAME"
+echo ""
+
+# Export PREBUILT_FILESYSTEM so pd_setup picks it up
+export PREBUILT_FILESYSTEM="$PREBUILT_DIR"
+
+# Run pd_setup with the remaining args
+exec "$DIRNAME/pd_setup" "$OUTPUT" "$VOLNAME"

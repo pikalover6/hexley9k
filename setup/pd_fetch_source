@@ -1,0 +1,234 @@
+#!/bin/sh
+#
+# Copyright (c) 2007-2010 The PureDarwin Project.
+# All rights reserved.
+#
+# @LICENSE_HEADER_START@
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+# IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+# THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+# PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+# LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+# NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# @LICENSE_HEADER_END@
+#
+
+#
+# pd_fetch_source
+#
+# Fetches Darwin open source component tarballs from the
+# apple-oss-distributions GitHub organisation (and local Mirror archives)
+# for every project that has a patch in patches/.
+#
+# After this script completes, run pd_patch_source to apply the patches,
+# then pd_build_source (on macOS) to compile and produce .root.tar.gz files.
+#
+# Usage:
+#   cd <repo-root>          # or setup/
+#   ./setup/pd_fetch_source
+#
+# Requirements:
+#   - git (for Apple GitHub repos)
+#   - tar, gzip (for Mirror archives -- already bundled in puredarwin.roots/Mirror/)
+#
+# Notes:
+#   - boot-132 (DFE bootloader) source is NOT fetched here.  Its source was
+#     hosted on Google Code, which is now defunct.  The pre-built binary root
+#     at puredarwin.roots/Roots/9F33pd1/boot.root.tar.gz is used instead.
+#   - launchd is fetched at two tags: 258.18 (for 9J61pd1 builds) and 258.1
+#     (for older 9F33pd1/9G55pd1 builds).  Each lands in its own subdirectory.
+#   - libdwarf comes from puredarwin.roots/Mirror/libdwarf-8.tar.gz (already
+#     in the repo); no network access is required for it.
+#
+
+set -e
+
+# ---------------------------------------------------------------------------
+# Locate repo root regardless of where the script is invoked from.
+# ---------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "$0")"; pwd)"
+case "$SCRIPT_DIR" in
+    */setup) REPO_ROOT="$(dirname "$SCRIPT_DIR")" ;;
+    *)       REPO_ROOT="$SCRIPT_DIR" ;;
+esac
+
+SOURCE_DIR="$REPO_ROOT/source"
+MIRROR_DIR="$REPO_ROOT/puredarwin.roots/Mirror"
+APPLE_ORG="https://github.com/apple-oss-distributions"
+
+echo "==> pd_fetch_source"
+echo "    Repo root : $REPO_ROOT"
+echo "    Source dir: $SOURCE_DIR"
+echo ""
+
+mkdir -p "$SOURCE_DIR/apple"
+mkdir -p "$SOURCE_DIR/third_party"
+
+# ---------------------------------------------------------------------------
+# Helper: shallow-clone one Apple project at an exact tag.
+#   fetch_apple <github-repo-name> <tag> [<local-subdir-name>]
+# The optional third argument allows two clones of the same repo (launchd).
+# ---------------------------------------------------------------------------
+fetch_apple() {
+    _project="$1"
+    _tag="$2"
+    _dest_name="${3:-$_project}"
+    _dest="$SOURCE_DIR/apple/$_dest_name"
+
+    if [ -d "$_dest/.git" ]; then
+        echo "  [skip] source/apple/$_dest_name (already fetched)"
+        return 0
+    fi
+
+    echo "  Cloning $APPLE_ORG/$_project @ $_tag -> source/apple/$_dest_name"
+    git clone --quiet --depth=1 --branch "$_tag" \
+        "$APPLE_ORG/$_project" "$_dest" \
+        || { echo "  ERROR: failed to clone $_project @ $_tag"; return 1; }
+}
+
+# ---------------------------------------------------------------------------
+# Helper: extract a tarball from puredarwin.roots/Mirror/ into source/third_party/.
+#   fetch_mirror <archive-filename> <expected-extracted-dirname>
+# If the archive extracts to a different directory name, pass a third arg
+# with the rename target.
+# ---------------------------------------------------------------------------
+fetch_mirror() {
+    _archive="$1"
+    _extracted="$2"
+    _rename="${3:-}"   # optional: rename extracted dir to this name
+    _final="${_rename:-$_extracted}"
+    _dest="$SOURCE_DIR/third_party/$_final"
+
+    if [ -d "$_dest" ]; then
+        echo "  [skip] source/third_party/$_final (already extracted)"
+        return 0
+    fi
+
+    _tarball="$MIRROR_DIR/$_archive"
+    if [ ! -f "$_tarball" ]; then
+        echo "  ERROR: Mirror archive not found: $_tarball"
+        return 1
+    fi
+
+    echo "  Extracting $MIRROR_DIR/$_archive -> source/third_party/$_final"
+    tar xzf "$_tarball" -C "$SOURCE_DIR/third_party"
+
+    # Rename if the archive extracted under a different name.
+    if [ -n "$_rename" ] && [ "$_extracted" != "$_rename" ]; then
+        if [ -d "$SOURCE_DIR/third_party/$_extracted" ]; then
+            mv "$SOURCE_DIR/third_party/$_extracted" "$_dest"
+        else
+            echo "  WARNING: expected extracted dir '$_extracted' not found; skipping rename"
+        fi
+    fi
+}
+
+# ===========================================================================
+# Apple open-source projects (from apple-oss-distributions on GitHub)
+# Each entry: fetch_apple <github-repo> <tag> [<local-name>]
+#
+# Tags are the exact versions targeted by the patches in patches/:
+#   - at_cmds-54          referenced by patches/at_cmds-54.p1.patch
+#   - bless-63.2          referenced by patches/bless-63.2.p1.patch
+#   - CF-476.15           referenced by patches/CF-476.15.*.p1.patch
+#   - configd-212.2       referenced by patches/configd-212.2.*.p1.patch
+#   - dtrace-48           referenced by patches/dtrace-48.*.p1.patch
+#   - gnutar-442.0.1      referenced by patches/gnutar-442.0.1.p1.patch
+#   - IOAudioFamily-169.4.3 referenced by patches/IOAudioFamily-169.4.3.p1.patch.0
+#   - iodbc-34            referenced by patches/iodbc-34.p1.patch
+#   - IOHIDFamily-258.3   referenced by patches/IOHIDFamily.*.p1.patch
+#   - IOKitUser-388.2.1   referenced by patches/IOKitUser-388.2.1.*.p1.patch
+#   - ipv6configuration-27 referenced by patches/ipv6configuration-27.p1.patch
+#   - kext_tools-117      referenced by patches/kext_tools-117.*.p1.patch
+#   - launchd-258.18      referenced by patches/launchd-258.18.*.p1.patch  (9J61pd1)
+#   - launchd-258.1       referenced by patches/launchd-258.1.p1.patch     (9F33pd1)
+#   - libsecurity_apple_csp-35205  patches/libsecurity_apple_csp-35205.p1.patch
+#   - libsecurity_filevault-28631  patches/libsecurity_filevault-28631.p1.patch
+#   - mDNSResponder-176.2 referenced by patches/mDNSResponder-176.2.*.p1.patch
+#   - Tokend-35209        referenced by patches/Tokend-35209.MacTypes.patch
+# ===========================================================================
+
+echo "--- Apple open-source projects ---"
+
+fetch_apple at_cmds          at_cmds-54
+fetch_apple bless            bless-63.2
+fetch_apple CF               CF-476.15
+fetch_apple configd          configd-212.2
+fetch_apple dtrace           dtrace-48
+fetch_apple gnutar           gnutar-442.0.1
+fetch_apple IOAudioFamily    IOAudioFamily-169.4.3
+fetch_apple iodbc            iodbc-34
+fetch_apple IOHIDFamily      IOHIDFamily-258.3
+fetch_apple IOKitUser        IOKitUser-388.2.1
+fetch_apple ipv6configuration ipv6configuration-27
+fetch_apple kext_tools       kext_tools-117
+
+# launchd appears in two puredarwin releases at different version tags.
+# Clone each into its own subdirectory so both can be patched independently.
+fetch_apple launchd          launchd-258.18  launchd_258.18
+fetch_apple launchd          launchd-258.1   launchd_258.1
+
+fetch_apple libsecurity_apple_csp  libsecurity_apple_csp-35205
+fetch_apple libsecurity_filevault  libsecurity_filevault-28631
+fetch_apple mDNSResponder    mDNSResponder-176.2
+fetch_apple Tokend           Tokend-35209
+
+# ===========================================================================
+# Third-party sources (from puredarwin.roots/Mirror/ -- already in the repo)
+#
+# libdwarf: the Mirror archive is named libdwarf-8.tar.gz.  The PureDarwin
+# build system called it version 8, but the upstream release tarball uses the
+# date format (20081013) which is also what the patch paths reflect.
+# We extract the archive and rename the top-level directory accordingly so
+# that pd_patch_source can find it at source/third_party/libdwarf-20081013/.
+#
+# libelf: a build dependency of both libdwarf and dtrace; no patches needed
+# but must be present if you intend to run pd_build_source.
+# ===========================================================================
+
+echo ""
+echo "--- Third-party sources (from Mirror) ---"
+
+# Detect the actual directory name inside libdwarf-8.tar.gz at runtime.
+_libdwarf_inner=$(tar tzf "$MIRROR_DIR/libdwarf-8.tar.gz" 2>/dev/null \
+    | head -1 | sed 's|/.*||')
+fetch_mirror libdwarf-8.tar.gz "$_libdwarf_inner" libdwarf-20081013
+
+fetch_mirror libelf-3.tar.gz libelf-3
+
+# ===========================================================================
+# Not fetched here (and why):
+#
+# boot-132 (DFE bootloader, patches/boot-132_dfe_r12*.p0.patch):
+#   Source was on Google Code (puredarwin.googlecode.com), now defunct.
+#   The pre-built binary root is already present at:
+#     puredarwin.roots/Roots/9F33pd1/boot.root.tar.gz
+#   Use that directly; no source build needed for boot-132.
+#
+# Patches referenced in 9J61pd1.plist that are missing from patches/:
+#   CFNetwork-129.20.p1.patch.0, JavaScriptCore-5525.26.2.p1.patch.0,
+#   Libc-498.1.7.p1.patch.0, efax-28.p1.patch.{0,1}, emacs-70.1.p1.patch.{0,1},
+#   libsecurity_ldap_dl-30174.p1.patch.0, security_dotmac_tp-33607.p1.patch.{0,1,2}
+#   These patch files were not archived when the repo was assembled.
+#   Binary roots for those projects are available in puredarwin.roots/Roots/.
+# ===========================================================================
+
+echo ""
+echo "==> pd_fetch_source complete."
+echo "    Next step: run setup/pd_patch_source"

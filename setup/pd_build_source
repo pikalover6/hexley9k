@@ -1,0 +1,318 @@
+#!/bin/sh
+#
+# Copyright (c) 2007-2010 The PureDarwin Project.
+# All rights reserved.
+#
+# @LICENSE_HEADER_START@
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+# IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+# THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+# PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+# LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+# NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# @LICENSE_HEADER_END@
+#
+
+#
+# pd_build_source
+#
+# Compiles the patched Darwin source trees under source/ using DarwinBuild
+# and emits .root.tar.gz files into puredarwin.roots/Roots/<build>/ so that
+# pd_setup can pick them up exactly like the pre-built roots that were
+# originally downloaded from macosforge.
+#
+# ============================================================
+# REQUIREMENTS  (this script will abort if they are not met)
+# ============================================================
+#
+#  1. macOS Leopard (10.5) or Snow Leopard (10.6) recommended.
+#     Building on later versions is possible but requires extra SDK
+#     compatibility work that is outside the scope of this script.
+#
+#  2. Xcode 3.x with the 10.5 SDK installed.
+#       Xcode 3.1.4 is the last release that fully supports the 10.5 SDK.
+#       Download from https://developer.apple.com/download/more/
+#       (free Apple Developer account required).
+#
+#  3. DarwinBuild -- the PureDarwin build driver.
+#     Clone and install it:
+#       git clone https://github.com/apple-oss-distributions/darwinbuild
+#       cd darwinbuild && make install
+#     DarwinBuild installs to /usr/local/bin/darwinbuild by default.
+#
+#  4. Run pd_fetch_source and pd_patch_source first so that source/ is
+#     populated with patched sources.
+#
+#  5. Must be run as root (DarwinBuild chroots into a build environment).
+#
+# ============================================================
+# HOW IT WORKS
+# ============================================================
+#
+# DarwinBuild reads a .plist file (here: plists/9J61pd1.plist) which
+# describes each project's version, dependencies, and patch files.
+# Normally it downloads source tarballs from macosforge.  We bypass that
+# by pre-populating its SourceCache with the already-patched sources from
+# source/.  DarwinBuild then compiles, creates a DSTROOT, and produces a
+# .root.tar.gz which we copy into puredarwin.roots/Roots/9J61pd1/.
+#
+# DarwinBuild build tree layout:
+#   $BUILDROOT/                       -- chosen by -build or default /var/tmp/darwinbuild
+#   $BUILDROOT/SourceCache/           -- sources are staged here before build
+#   $BUILDROOT/Roots/                 -- .root.tar.gz output lands here
+#   $BUILDROOT/Headers/               -- per-project installed headers
+#   $BUILDROOT/Symbols/               -- debug symbols
+#
+# Usage:
+#   sudo ./setup/pd_build_source [project ...]
+#
+# If no project names are given, all patched projects are built in
+# dependency order.  You can build a single project (e.g. after editing
+# its source) by naming it on the command line.
+#
+# Examples:
+#   sudo ./setup/pd_build_source
+#   sudo ./setup/pd_build_source launchd
+#   sudo ./setup/pd_build_source kext_tools IOKitUser
+#
+
+set -e
+
+# ---------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "$0")"; pwd)"
+case "$SCRIPT_DIR" in
+    */setup) REPO_ROOT="$(dirname "$SCRIPT_DIR")" ;;
+    *)       REPO_ROOT="$SCRIPT_DIR" ;;
+esac
+
+SOURCE_DIR="$REPO_ROOT/source"
+ROOTS_OUT="$REPO_ROOT/puredarwin.roots/Roots"
+PLISTS_DIR="$REPO_ROOT/plists"
+
+# DarwinBuild target build identifier (matches plists/9J61pd1.plist)
+BUILD="9J61pd1"
+PLIST="$PLISTS_DIR/${BUILD}.plist"
+
+# DarwinBuild working directory (can be overridden by caller)
+DARWINBUILD_ROOT="${DARWINBUILD_ROOT:-/var/tmp/darwinbuild_pd}"
+DARWINBUILD="${DARWINBUILD:-darwinbuild}"
+
+# ---------------------------------------------------------------------------
+# Pre-flight checks
+# ---------------------------------------------------------------------------
+if [ "$(uname -s)" != "Darwin" ]; then
+    echo "ERROR: pd_build_source must be run on macOS."
+    exit 1
+fi
+
+if [ "$(id -u)" != "0" ]; then
+    echo "ERROR: pd_build_source must be run as root (sudo ./setup/pd_build_source)."
+    exit 1
+fi
+
+if ! command -v "$DARWINBUILD" >/dev/null 2>&1; then
+    cat <<'MSG'
+ERROR: darwinbuild not found.
+
+Install it from source:
+  git clone https://github.com/apple-oss-distributions/darwinbuild
+  cd darwinbuild
+  sudo make install
+
+Then re-run this script.
+MSG
+    exit 1
+fi
+
+if [ ! -f "$PLIST" ]; then
+    echo "ERROR: Build plist not found: $PLIST"
+    exit 1
+fi
+
+if [ ! -d "$SOURCE_DIR/apple" ]; then
+    echo "ERROR: source/ directory not found.  Run pd_fetch_source first."
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Initialise DarwinBuild build root (first run only)
+# ---------------------------------------------------------------------------
+echo "==> pd_build_source  (build: $BUILD)"
+echo "    Build root: $DARWINBUILD_ROOT"
+echo ""
+
+mkdir -p "$DARWINBUILD_ROOT"
+if [ ! -f "$DARWINBUILD_ROOT/.build" ]; then
+    echo "--- Initialising DarwinBuild build root ---"
+    (cd "$DARWINBUILD_ROOT" && "$DARWINBUILD" -init "$PLIST")
+fi
+
+# ---------------------------------------------------------------------------
+# Helper: stage patched source for DarwinBuild.
+#
+# DarwinBuild looks for source at:
+#   $DARWINBUILD_ROOT/SourceCache/<project>/<project>-<version>/
+#
+# We symlink our pre-patched tree there so DarwinBuild skips its own
+# download+patch steps.
+#
+# Usage: stage_source <github-subdir> <darwinbuild-project> <version>
+#   e.g.: stage_source apple/configd configd 212.2
+# ---------------------------------------------------------------------------
+stage_source() {
+    _src_subdir="$1"
+    _project="$2"
+    _version="$3"
+    _src="$SOURCE_DIR/$_src_subdir"
+    _cache_dir="$DARWINBUILD_ROOT/SourceCache/$_project"
+    _cache_target="$_cache_dir/${_project}-${_version}"
+
+    if [ ! -d "$_src" ]; then
+        echo "  WARNING: source/$_src_subdir not found; DarwinBuild will attempt"
+        echo "           to download $PROJECT-$_version from the network."
+        return
+    fi
+
+    mkdir -p "$_cache_dir"
+    if [ -L "$_cache_target" ]; then
+        echo "  [staged] $_cache_target (already linked)"
+    elif [ -d "$_cache_target" ]; then
+        echo "  [staged] $_cache_target (directory already present)"
+    else
+        echo "  Staging source/$_src_subdir -> SourceCache/$_project/${_project}-${_version}"
+        ln -s "$_src" "$_cache_target"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Helper: invoke DarwinBuild for one project and copy the resulting root.
+# ---------------------------------------------------------------------------
+build_project() {
+    _project="$1"
+    echo ""
+    echo "=== Building: $_project ==="
+
+    (cd "$DARWINBUILD_ROOT" && "$DARWINBUILD" "$_project") \
+        || { echo "ERROR: darwinbuild failed for $_project"; return 1; }
+
+    # Locate the freshly built root and copy it to our repository.
+    _root=$(find "$DARWINBUILD_ROOT/Roots" \
+        -name "${_project}.root.tar.gz" -newer "$DARWINBUILD_ROOT/.build" \
+        2>/dev/null | head -1)
+    if [ -n "$_root" ]; then
+        _out_dir="$ROOTS_OUT/${BUILD}"
+        mkdir -p "$_out_dir"
+        cp "$_root" "$_out_dir/"
+        echo "  -> Saved to puredarwin.roots/Roots/${BUILD}/${_project}.root.tar.gz"
+    else
+        echo "  WARNING: could not locate output root for $_project"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Stage all patched sources before building anything.
+# ---------------------------------------------------------------------------
+echo "--- Staging patched sources into DarwinBuild SourceCache ---"
+
+stage_source apple/at_cmds                 at_cmds              54
+stage_source apple/bless                   bless                63.2
+stage_source apple/CF                      CF                   476.15
+stage_source apple/configd                 configd              212.2
+stage_source apple/dtrace                  dtrace               48
+stage_source apple/gnutar                  gnutar               442.0.1
+stage_source apple/IOAudioFamily           IOAudioFamily        169.4.3
+stage_source apple/iodbc                   iodbc                34
+stage_source apple/IOHIDFamily             IOHIDFamily          258.3
+stage_source apple/IOKitUser               IOKitUser            388.2.1
+stage_source apple/ipv6configuration       ipv6configuration    27
+stage_source apple/kext_tools              kext_tools           117
+stage_source apple/launchd_258.18          launchd              258.18
+stage_source apple/libsecurity_apple_csp   libsecurity_apple_csp 35205
+stage_source apple/libsecurity_filevault   libsecurity_filevault 28631
+stage_source apple/mDNSResponder           mDNSResponder        176.2
+stage_source apple/Tokend                  Tokend               35209
+
+# libdwarf and libelf come from the Mirror and have non-standard version naming.
+stage_source third_party/libdwarf-20081013 libdwarf             20081013
+stage_source third_party/libelf-3          libelf               3
+
+# ---------------------------------------------------------------------------
+# Determine which projects to build.
+#
+# Dependency order matters: projects that other projects link against should
+# come first.  The order below is a safe sequencing derived from the
+# 9J61pd1.plist dependency declarations.
+# ---------------------------------------------------------------------------
+
+# Ordered list of patched projects for a full source build.
+ALL_PROJECTS="
+    libelf
+    libdwarf
+    dtrace
+    IOKitUser
+    IOHIDFamily
+    IOAudioFamily
+    iodbc
+    kext_tools
+    at_cmds
+    bless
+    configd
+    gnutar
+    ipv6configuration
+    launchd
+    libsecurity_apple_csp
+    libsecurity_filevault
+    mDNSResponder
+    Tokend
+    CF
+"
+# NOTE: launchd-258.1 (for older 9F33pd1 builds) is NOT in this list by default;
+# switch the launchd staging above to apple/launchd_258.1 / version 258.1 and
+# set BUILD=9F33pd1 if targeting that older release.
+
+if [ $# -gt 0 ]; then
+    # Build only the projects named on the command line.
+    BUILD_LIST="$*"
+else
+    BUILD_LIST="$ALL_PROJECTS"
+fi
+
+# ---------------------------------------------------------------------------
+# Build loop
+# ---------------------------------------------------------------------------
+FAILED=""
+for _proj in $BUILD_LIST; do
+    build_project "$_proj" || FAILED="$FAILED $_proj"
+done
+
+echo ""
+if [ -n "$FAILED" ]; then
+    echo "==> pd_build_source finished with errors in:$FAILED"
+    echo "    Check the DarwinBuild log in $DARWINBUILD_ROOT/Logs/"
+    exit 1
+else
+    echo "==> pd_build_source complete."
+    echo "    Roots written to: puredarwin.roots/Roots/$BUILD/"
+    echo ""
+    echo "    Next steps:"
+    echo "      cd setup"
+    echo "      sudo ./pd_setup puredarwin.vmwarevm PureDarwin"
+    echo "    -- or, if using the pre-assembled filesystem tree:"
+    echo "      sudo ./pd_setup_prebuilt ../extracted/filesystem/PureDarwinXmas puredarwin.vmwarevm PureDarwin"
+fi

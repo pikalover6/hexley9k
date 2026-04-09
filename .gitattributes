@@ -1,0 +1,14 @@
+puredarwin.roots/Roots/**/*.root.tar.gz filter=lfs diff=lfs merge=lfs -text
+puredarwin.roots/Roots/**/*.tar.gz filter=lfs diff=lfs merge=lfs -text
+puredarwin.roots/Roots/**/*.tbz2 filter=lfs diff=lfs merge=lfs -text
+puredarwin.roots/Mirror/*.tar.gz filter=lfs diff=lfs merge=lfs -text
+setup/pd_setup_files/mkisofs filter=lfs diff=lfs merge=lfs -text
+setup/pd_setup_files/qemu-img filter=lfs diff=lfs merge=lfs -text
+setup/pd_setup_files/iofindwholemedia filter=lfs diff=lfs merge=lfs -text
+setup/pd_setup_files/startupfiletool filter=lfs diff=lfs merge=lfs -text
+setup/pd_setup_files/*.zip filter=lfs diff=lfs merge=lfs -text
+projects/pd_xkp/pd_xkp filter=lfs diff=lfs merge=lfs -text
+projects/PureDarwinPackageDatabase/pdpd filter=lfs diff=lfs merge=lfs -text
+projects/PureDarwinPackageDatabase/tools/pdpdmake filter=lfs diff=lfs merge=lfs -text
+projects/PureDarwinPackageDatabase/tools/dbaudit filter=lfs diff=lfs merge=lfs -text
+projects/PureDarwinPackageDatabase/tools/dbstats filter=lfs diff=lfs merge=lfs -text

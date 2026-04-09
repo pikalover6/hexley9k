@@ -243,6 +243,18 @@ ADD_DTRACE="y"			# (default: n) Add DTrace
 
 ADD_KEXTCACHE="n"		# (default: y) Add creation of kext cache file
 
+#
+# Prebuilt filesystem mode
+#
+# When set to a path, pd_setup will copy this directory directly into the target
+# volume instead of unpacking individual binary roots. Use this when you have an
+# already-assembled Darwin filesystem you want to tinker with and rebuild.
+# Set to "" to use the normal roots-based build flow.
+#
+if [ "$PREBUILT_FILESYSTEM" = "" ]; then
+	PREBUILT_FILESYSTEM=""
+fi
+
 # 
 # Darwin 10 full options
 #

@@ -80,12 +80,88 @@ PUREDARWIN_RELEASE="" ./pd_fetch
 PUREDARWIN_RELEASE="" ./pd_thin
 PUREDARWIN_RELEASE="bootstrap" ./pd_setup arg1 arg2
 
+Building from Source (new pipeline)
+====================================
+
+The original pd_fetch / pd_thin steps download pre-compiled binary roots
+from macosforge, which is long gone.  The repository now includes a
+source-based pipeline that fetches Darwin open-source component source
+directly from Apple's GitHub mirror and applies the PureDarwin patches.
+
+Step A.  Fetch source (any OS, only needs git + tar)
+     cd <repo-root>
+     ./setup/pd_fetch_source
+
+     This clones each patched Darwin project from apple-oss-distributions at
+     the exact tagged version targeted by the patches, populating source/.
+     Third-party sources (libdwarf, libelf) are extracted from the bundled
+     archives in puredarwin.roots/Mirror/.
+
+Step B.  Apply patches (any OS, only needs the patch(1) utility)
+     ./setup/pd_patch_source
+
+     Applies every patch from patches/ to the corresponding source tree.
+     The --forward flag makes this idempotent; re-running is safe.
+
+Step C.  Build (macOS only -- Leopard/Snow Leopard recommended)
+     sudo ./setup/pd_build_source
+
+     Uses DarwinBuild to compile each patched project and writes the
+     resulting .root.tar.gz files to puredarwin.roots/Roots/9J61pd1/.
+     DarwinBuild must be installed first:
+       git clone https://github.com/apple-oss-distributions/darwinbuild
+       cd darwinbuild && sudo make install
+
+     You can build a single project:
+       sudo ./setup/pd_build_source kext_tools
+
+Step D.  Assemble the image (macOS only, same as before)
+     sudo ./setup/pd_setup puredarwin.vmwarevm PureDarwin
+     -- or, using the pre-extracted filesystem already in the repo:
+     sudo ./setup/pd_setup_prebuilt ../extracted/filesystem/PureDarwinXmas \
+          puredarwin.vmwarevm PureDarwin
+
+Binary roots for projects that have no patches (and thus no source in this
+repo) remain available as pre-built archives under puredarwin.roots/Roots/.
+They are used automatically by pd_setup.
+
+Source-to-patch mapping
+-----------------------
+
+The following Darwin projects are fetched and patched by Steps A-B:
+
+  Project               Tag                    Patches
+  at_cmds               at_cmds-54             at_cmds-54.p1.patch
+  bless                 bless-63.2             bless-63.2.p1.patch
+  CF                    CF-476.15              CF-476.15.*.p1.patch
+  configd               configd-212.2          configd-212.2.*.p1.patch
+  dtrace                dtrace-48              dtrace-48.*.p1.patch
+  gnutar                gnutar-442.0.1         gnutar-442.0.1.p1.patch
+  IOAudioFamily         IOAudioFamily-169.4.3  IOAudioFamily-169.4.3.p1.patch.0
+  iodbc                 iodbc-34               iodbc-34.p1.patch
+  IOHIDFamily           IOHIDFamily-258.3      IOHIDFamily.*.p1.patch
+  IOKitUser             IOKitUser-388.2.1      IOKitUser-388.2.1.*.p1.patch
+  ipv6configuration     ipv6configuration-27   ipv6configuration-27.p1.patch
+  kext_tools            kext_tools-117         kext_tools-117.*.p1.patch
+  launchd (9J61pd1)     launchd-258.18         launchd-258.18.*.p1.patch
+  launchd (9F33pd1)     launchd-258.1          launchd-258.1.p1.patch
+  libdwarf              20081013 (from Mirror)  libdwarf-20081013.*.p1.patch
+  libsecurity_apple_csp libsecurity_apple_csp-35205
+  libsecurity_filevault libsecurity_filevault-28631
+  mDNSResponder         mDNSResponder-176.2    mDNSResponder-176.2.*.p1.patch
+  Tokend                Tokend-35209           Tokend-35209.MacTypes.patch
+
+  boot-132 (DFE): source is unavailable (Google Code, defunct).  The
+  binary root at puredarwin.roots/Roots/9F33pd1/boot.root.tar.gz is used.
+
 Resources
 =========
 
 http://opensource.apple.com
+https://github.com/apple-oss-distributions          (Darwin source mirror)
+https://github.com/apple-oss-distributions/darwinbuild
 http://www.puredarwin.org
-http://puredarwin.googlecode.com
+http://puredarwin.googlecode.com                    (archived; mostly dead)
 
 #puredarwin on irc.freenode.net
 contact at puredarwin.org

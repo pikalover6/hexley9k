@@ -1,0 +1,33 @@
+# -----------------------------------------------------------------------
+# hexley9k – gitignore
+# -----------------------------------------------------------------------
+
+# Darwin source trees fetched by setup/pd_fetch_source.
+# Not committed; reconstructed at build time from apple-oss-distributions.
+source/
+
+# Extracted PureDarwin Xmas filesystem tree.
+# 455 MB / 29k files — too large for regular git.
+# Reconstruct on macOS with: sudo ./setup/pd_setup_prebuilt
+# Or download the original Xmas image and extract manually.
+extracted/
+
+# DarwinBuild working directory created by setup/pd_build_source.
+# Defaults to /var/tmp/darwinbuild_pd/ but may be overridden.
+/var/tmp/darwinbuild_pd/
+
+# Temporary PureDarwin image-assembly outputs (pd_setup scratch space).
+pd_tmp/
+
+# Output artefacts produced by setup/pd_setup – add them locally if needed.
+*.vmwarevm/
+*.vmdk
+*.iso
+*.img
+
+# macOS filesystem noise.
+.DS_Store
+.fseventsd/
+.Trashes/
+.Spotlight-V100/
+*.orig
