@@ -13,14 +13,12 @@ The project is named after [Hexley](https://en.wikipedia.org/wiki/Hexley), the D
 3. [Build Pipeline Overview](#3-build-pipeline-overview)
 4. [Requirements](#4-requirements)
 5. [Step-by-Step Build Guide](#5-step-by-step-build-guide)
-   - [Step 0 — Clone this repo](#step-0--clone-this-repo)
-   - [Step 1 — Fetch source](#step-1--fetch-source-any-os)
-   - [Step 2 — Apply patches](#step-2--apply-patches-any-os)
-   - [Step 3 — Compile (macOS)](#step-3--compile-macos-only)
-   - [Step 4 — Assemble the image (macOS)](#step-4--assemble-the-image-macos-only)
+   - [Step 1 — Clone this repo](#step-1--clone-this-repo)
+   - [Step 2 — Compile (macOS)](#step-2--compile-macos-only)
+   - [Step 3 — Assemble the image (macOS)](#step-3--assemble-the-image-macos-only)
    - [Shortcut — Use the pre-built filesystem](#shortcut--use-the-pre-built-filesystem)
 6. [Offline Build](#6-offline-build)
-7. [Source Patch Map](#7-source-patch-map)
+7. [Source Changes Reference](#7-source-changes-reference)
 8. [Binary Roots Reference](#8-binary-roots-reference)
 9. [Repo Contents Detail](#9-repo-contents-detail)
 10. [Key Technical Details](#10-key-technical-details)
@@ -51,9 +49,6 @@ hexley9k/
 ├── APPLE_LICENSE.txt                ← Apple Public Source License (APSL 2.0)
 ├── APPLE_DRIVER_LICENSE.txt         ← Apple Binary Driver EULA
 ├── PUREDARWIN_LICENSE.txt           ← PureDarwin BSD license
-│
-├── patches/                         ← Unified diffs applied by pd_patch_source
-│   └── <project>-<version>.*.p1.patch
 │
 ├── plists/                          ← DarwinBuild project descriptor
 │   └── 9J61pd1.plist                ← Darwin 9 / 10.5.7 / PureDarwin build target
@@ -115,11 +110,9 @@ hexley9k/
 │
 ├── setup/                           ← Build pipeline scripts (run on macOS host)
 │   ├── pd_config                    ← Global variables (ARCH=i386, DARWIN_RELEASE=9)
-│   ├── pd_fetch_source              ← Step 1: clone Darwin source from GitHub
-│   ├── pd_patch_source              ← Step 2: apply patches/
-│   ├── pd_build_source              ← Step 3: compile with DarwinBuild → .root.tar.gz
-│   ├── pd_setup                     ← Step 4: assemble bootable HFS+ / VMware image
-│   ├── pd_setup_prebuilt            ← Step 4 shortcut: package pre-extracted filesystem
+│   ├── pd_build_source              ← Step 2: compile with DarwinBuild → .root.tar.gz
+│   ├── pd_setup                     ← Step 3: assemble bootable HFS+ / VMware image
+│   ├── pd_setup_prebuilt            ← Step 3 shortcut: package pre-extracted filesystem
 │   ├── pd_roots                     ← Package list — full release (~160 packages)
 │   ├── pd_roots.bootstrap           ← Package list — bootstrap release (~60 packages)
 │   ├── pd_roots.nano                ← Package list — minimal nano release
@@ -146,8 +139,8 @@ hexley9k/
 │           ├── private/             ← etc → /etc, var → /var, tmp → /tmp symlinks
 │           └── ...
 │
-└── source/                          ← GENERATED — not committed to git
-    ├── apple/                       ← Cloned from apple-oss-distributions at tagged versions
+└── source/                          ← Pre-patched Apple Darwin source (committed)
+    ├── apple/                       ← Fetched from apple-oss-distributions at tagged versions, patches applied
     │   ├── at_cmds/                 ← at_cmds-54
     │   ├── bless/                   ← bless-63.2
     │   ├── CF/                      ← CF-476.15
@@ -171,7 +164,7 @@ hexley9k/
         └── libelf-3/                ← Extracted from puredarwin.roots/Mirror/libelf-3.tar.gz
 ```
 
-> `source/` is in `.gitignore`. It is fully reconstructed by `setup/pd_fetch_source` + `setup/pd_patch_source` and does not need to be committed.
+> `source/` is committed with all upstream patches already applied. Clone the repo and build — no separate fetch or patch step required.
 
 ---
 
@@ -181,13 +174,8 @@ hexley9k/
  [any OS]                   [macOS only]
     │                           │
   git clone hexley9k            │
-    │                           │
- pd_fetch_source ──────────────>│
- (git clone 20 Darwin repos     │
-  from apple-oss-distributions) │
-    │                           │
- pd_patch_source                │
- (apply patches/ to source/)    │
+  (source/ included,            │
+   patches pre-applied)         │
     │                           │
     └──────────────────────────>│
                            pd_build_source
@@ -201,7 +189,7 @@ hexley9k/
                            (bootable VMware VM)
 ```
 
-Steps 1–2 can be done on any OS with `git` and `patch(1)`. Steps 3–4 require a macOS host with specific tooling (see [Requirements](#4-requirements)).
+Cloning the repo gives you the pre-patched source directly. Compilation and image assembly require a macOS host with specific tooling (see [Requirements](#4-requirements)).
 
 ---
 
@@ -216,8 +204,7 @@ Steps 1–2 can be done on any OS with `git` and `patch(1)`. Steps 3–4 require
 |------|---------|-------|
 | Xcode | 3.x (3.1.4 last for 10.5) | Provides GCC 4.2, 10.5 SDK, project makefiles |
 | DarwinBuild | current git main | Build driver that sets up chroot + installs headers/roots |
-| git | any | For cloning source and this repo |
-| patch | any | For applying patches/ |
+| git | any | For cloning this repo |
 
 **Installing DarwinBuild:**
 ```sh
@@ -232,8 +219,7 @@ Xcode 3.x is available at [developer.apple.com/download/more](https://developer.
 ### Disk Space
 | Component | Approximate Size |
 |-----------|----------------|
-| This repo (without `source/`) | ~1.5 GB (binary roots + Xmas filesystem) |
-| `source/` after `pd_fetch_source` | ~300 MB |
+| This repo (with `source/`) | ~1.6 GB (binary roots + pre-patched source) |
 | DarwinBuild build root | ~5–10 GB |
 | Final `.vmwarevm` output | ~800 MB |
 
@@ -241,51 +227,19 @@ Xcode 3.x is available at [developer.apple.com/download/more](https://developer.
 
 ## 5. Step-by-Step Build Guide
 
-### Step 0 — Clone this repo
+### Step 1 — Clone this repo
 
 ```sh
 git clone https://github.com/your-org/hexley9k.git
+git lfs pull   # download binary roots via Git LFS
 cd hexley9k
 ```
 
-No submodules. No internet access is required after cloning for steps 1–4 if you use the offline path; see [Section 6](#6-offline-build).
+The repo includes `source/` with all Apple Darwin source already fetched and patched. No separate fetch or patch step is needed. No internet access is required after cloning; see [Section 6](#6-offline-build).
 
 ---
 
-### Step 1 — Fetch source (any OS)
-
-```sh
-./setup/pd_fetch_source
-```
-
-This script:
-- Shallow-clones 18 Apple Darwin source projects from `github.com/apple-oss-distributions` at the exact tags that correspond to the patches in `patches/`
-- Extracts `libdwarf` and `libelf` from the bundled archives in `puredarwin.roots/Mirror/`
-- Populates `source/apple/` and `source/third_party/`
-
-If a project directory already exists in `source/` the script skips it (idempotent). Re-running after a partial failure is safe.
-
-**Requires:** `git`, `tar`
-
----
-
-### Step 2 — Apply patches (any OS)
-
-```sh
-./setup/pd_patch_source
-```
-
-Applies every patch from `patches/` to the corresponding tree under `source/` using `patch -p1 --forward --batch`. The `--forward` flag makes this idempotent — already-applied hunks are skipped silently.
-
-Three `mDNSResponder` patches and one `libdwarf` patch cannot be applied with `patch(1)` directly due to path anomalies (see [Known Limitations](#11-known-limitations-and-issues)). These are applied as inline `sed` edits by the script.
-
-Exit code is 0 on full success, 1 if any patch failed. Failed patches are reported individually.
-
-**Requires:** `patch`, `sed`
-
----
-
-### Step 3 — Compile (macOS only)
+### Step 2 — Compile (macOS only)
 
 ```sh
 sudo ./setup/pd_build_source
@@ -297,7 +251,7 @@ sudo ./setup/pd_build_source kext_tools
 ```
 
 This script:
-1. Checks that `darwinbuild` is installed and that `source/` exists
+1. Checks that `darwinbuild` is installed and that `source/` exists (it is committed in the repo)
 2. Initialises a DarwinBuild build root at `/var/tmp/darwinbuild_pd/` using `plists/9J61pd1.plist` as the project descriptor
 3. Symlinks each patched source tree into DarwinBuild's `SourceCache/` so it skips its own download step
 4. Calls `darwinbuild <project>` for each project in dependency order
@@ -318,7 +272,7 @@ The compiled roots supplement (not replace) the pre-built roots already in `pure
 
 ---
 
-### Step 4 — Assemble the image (macOS only)
+### Step 3 — Assemble the image (macOS only)
 
 ```sh
 cd setup
@@ -371,86 +325,83 @@ sudo ./pd_setup_prebuilt ../extracted/filesystem/PureDarwinXmas puredarwin.vmwar
 
 ## 6. Offline Build
 
-After an initial `git clone` + `./setup/pd_fetch_source`, no internet access is needed for any subsequent step. Specifically:
+After an initial `git clone` + `git lfs pull`, no internet access is needed for any step. Specifically:
 
 | What needs network | When |
 |--------------------|------|
-| `git clone hexley9k` | once |
-| `pd_fetch_source` | once (or after `rm -rf source/`) |
+| `git clone hexley9k` + `git lfs pull` | once |
 | Installing DarwinBuild | once, on macOS |
 | Installing Xcode 3.x | once, on macOS |
 
-Everything else — patching, compiling, assembling — works entirely from local files. The `puredarwin.roots/Mirror/` directory contains bundled upstream source archives so even `libdwarf` and `libelf` do not need a network hit.
+Everything else — compiling, assembling — works entirely from local files. `source/` is committed with patches applied. The `puredarwin.roots/Mirror/` directory contains bundled upstream source archives so `libdwarf` and `libelf` build dependencies are also offline.
 
 ---
 
-## 7. Source Patch Map
+## 7. Source Changes Reference
 
-The table below lists every patch file in `patches/`, the Darwin project it targets, the exact version tag at which that project is cloned from GitHub, and what the patch does.
+The table below documents every change applied to the upstream Apple Darwin source trees in `source/`. All changes are already present in the committed source — this table serves as a reference for what was modified and why.
 
-| Patch file | Project | Tag | Description |
+| Change | Project | Version | Description |
 |-----------|---------|-----|-------------|
-| `at_cmds-54.p1.patch` | at_cmds | `at_cmds-54` | Define `_OPEN_SOURCE_` to bypass SystemIntegrity.h |
-| `bless-63.2.p1.patch` | bless | `bless-63.2` | Xcode project fix for open-source build |
-| `boot-132_dfe_r122.p0.patch` | boot-132 (DFE) | n/a — source gone | DFE bootloader; source unavailable; pre-built root used |
-| `boot-132_dfe_r122_pd1.p0.patch` | boot-132 (DFE) | n/a | As above |
-| `boot-132_dfe_r146.p0.patch` | boot-132 (DFE) | n/a | As above |
-| `CF-476.15.BuildCFLite.p1.patch` | CF | `CF-476.15` | Fix `install_name_tool` install path for CoreFoundation |
-| `CF-476.15.CFBundle_Resources.p1.patch` | CF | `CF-476.15` | CFBundle resource loading fix |
-| `configd-212.2.dy_framework.h.p1.patch` | configd | `configd-212.2` | Dynamic framework loading header |
-| `configd-212.2.SCDPrivate.c.p1.patch` | configd | `configd-212.2` | Comment out `CFStringTransform` call missing in PureFoundation |
-| `configd-212.2.SCNetworkConnection.c.p1.patch` | configd | `configd-212.2` | Network connection API stub |
-| `configd-212.2.SCNetworkConnectionPrivate.c.p1.patch` | configd | `configd-212.2` | Private connection API cleanup |
-| `configd-212.2.SCPrivate.h.p1.patch` | configd | `configd-212.2` | Private header adjustment |
-| `configd-212.2.SystemConfiguration.h.p1.patch` | configd | `configd-212.2` | SC framework public header fix |
-| `dtrace-48.dtrace_1.c.p1.patch` | dtrace | `dtrace-48` | Command-line tool build fix |
-| `dtrace-48.dt_ld.m.p1.patch` | dtrace | `dtrace-48` | Link-editor Objective-C file fix |
-| `dtrace-48.dt_pid_apple.m.p1.patch` | dtrace | `dtrace-48` | PID provider Apple-specific fix |
-| `dtrace-48.libproc.m.p1.patch` | dtrace | `dtrace-48` | Process inspection library fix |
-| `dtrace-48.libproc_apple.h.p1.patch` | dtrace | `dtrace-48` | Apple libproc header compatibility |
-| `dtrace-48.project.pbxproj.p1.patch` | dtrace | `dtrace-48` | Xcode project: add libelf/libdwarf deps |
-| `gnutar-442.0.1.p1.patch` | gnutar | `gnutar-442.0.1` | `common.h` build fix |
-| `IOAudioFamily-169.4.3.p1.patch.0` | IOAudioFamily | `IOAudioFamily-169.4.3` | KEXT mixer + Info.plist compatibility fix |
-| `iodbc-34.p1.patch` | iodbc | `iodbc-34` | Makefile build fix for open-source context |
-| `IOHIDFamily.IOHIDDeviceClass.cpp.p1.patch` | IOHIDFamily | `IOHIDFamily-258.3` | Add `objc/objc.h` include to fix linkage |
-| `IOHIDFamily.IOHIDQueueClass.cpp.p1.patch` | IOHIDFamily | `IOHIDFamily-258.3` | Same include fix for queue class |
-| `IOHIDFamily.IOHIDUPSClass.cpp.p1.patch` | IOHIDFamily | `IOHIDFamily-258.3` | Same include fix for UPS class |
-| `IOKitUser-388.2.1.IOAccelSurfaceControl.c.p1.patch` | IOKitUser | `IOKitUser-388.2.1` | Accelerator surface control fix |
-| `IOKitUser-388.2.1.IODisplayLib.c.p1.patch` | IOKitUser | `IOKitUser-388.2.1` | Display library fix |
-| `IOKitUser-388.2.1.IOGraphicsLib.c.p1.patch` | IOKitUser | `IOKitUser-388.2.1` | Graphics library fix |
-| `IOKitUser-388.2.1.IOHIDEventSystem.c.p1.patch` | IOKitUser | `IOKitUser-388.2.1` | HID event system fix |
-| `IOKitUser-388.2.1.IOPMAutoWake.c.p1.patch` | IOKitUser | `IOKitUser-388.2.1` | Power management auto-wake |
-| `IOKitUser-388.2.1.IOPMEnergyPrefs.c.p1.patch` | IOKitUser | `IOKitUser-388.2.1` | Energy preferences |
-| `IOKitUser-388.2.1.IOPMLibPrivate.c.p1.patch` | IOKitUser | `IOKitUser-388.2.1` | Private PM library |
-| `IOKitUser-388.2.1.IOPMPowerNotifications.c.p1.patch` | IOKitUser | `IOKitUser-388.2.1` | Power notification fix |
-| `IOKitUser-388.2.1.IOPMRepeatingPower.c.p1.patch` | IOKitUser | `IOKitUser-388.2.1` | Repeating power event fix |
-| `IOKitUser-388.2.1.IOPMUPSPrefs.c.p1.patch` | IOKitUser | `IOKitUser-388.2.1` | UPS preferences fix |
-| `IOKitUser-388.2.1.IOPowerSources.c.p1.patch` | IOKitUser | `IOKitUser-388.2.1` | Power source API |
-| `IOKitUser-388.2.1.IOPowerSourcesPrivate.c.p1.patch` | IOKitUser | `IOKitUser-388.2.1` | Private power source API |
-| `IOKitUser-388.2.1.IOSystemConfiguration.c.p1.patch` | IOKitUser | `IOKitUser-388.2.1` | System configuration |
-| `IOKitUser-388.2.1.p1.patch` | IOKitUser | `IOKitUser-388.2.1` | IOKitLib.h + GetSymbolFromPEF.h + HID defs fix |
-| `IOKitUser-388.2.1.PEFSupport.c.p1.patch` | IOKitUser | `IOKitUser-388.2.1` | PEF binary support |
-| `ipv6configuration-27.p1.patch` | ipv6configuration | `ipv6configuration-27` | IPv6 service library fix |
-| `kext_tools-117.bootcaches.c.p1.patch` | kext_tools | `kext_tools-117` | Disable BootCache update checks |
-| `kext_tools-117.globals.h.p1.patch` | kext_tools | `kext_tools-117` | Global variable declarations |
-| `kext_tools-117.kextd_main.c.p1.patch` | kext_tools | `kext_tools-117` | kextd startup fix for PureDarwin |
-| `kext_tools-117.prelink.c.p1.patch` | kext_tools | `kext_tools-117` | Prelink fix |
-| `kext_tools-117.project.pbxproj.p1.patch` | kext_tools | `kext_tools-117` | Xcode project fix |
-| `kext_tools-117.update_boot.c.p1.patch` | kext_tools | `kext_tools-117` | Boot update fix |
-| `kext_tools-117.watchvol.h.p1.patch` | kext_tools | `kext_tools-117` | Volume watch header |
-| `launchd-258.18.launchd.p1.patch` | launchd | `launchd-258.18` | Remove AppleTalk dependency |
-| `launchd-258.18.launchproxy.p1.patch` | launchd | `launchd-258.18` | Proxy fix |
-| `launchd-258.18.p1.patch` | launchd | `launchd-258.18` | SystemStarter + config.h.in fix |
-| `launchd-258.1.p1.patch` | launchd | `launchd-258.1` | Remove quarantine API dependency (9F33pd1) |
-| `libdwarf-20081013.pro_alloc.c.p1.patch` | libdwarf | Mirror/libdwarf-8.tar.gz | `malloc.h` → `sys/malloc.h` (pre-applied in archive) |
-| `libsecurity_apple_csp-35205.p1.patch` | libsecurity_apple_csp | `libsecurity_apple_csp-35205` | Xcode project fix |
-| `libsecurity_filevault-28631.p1.patch` | libsecurity_filevault | `libsecurity_filevault-28631` | FileVault interface fix |
-| `mDNSResponder-176.2.daemon.c.p1.patch` | mDNSResponder | `mDNSResponder-176.2` | Add `CarbonCore/MacTypes.h` include |
-| `mDNSResponder-176.2.mDNSEmbeddedAPI.h.p1.patch` | mDNSResponder | `mDNSResponder-176.2` | Comment out failing size assertions (**applied via sed**) |
-| `mDNSResponder-176.2.mDNSMacOSX.c.p1.patch` | mDNSResponder | `mDNSResponder-176.2` | macOS-specific daemon fix |
-| `mDNSResponder-176.2.uDNS.c.p1.patch` | mDNSResponder | `mDNSResponder-176.2` | uDNS size assertion fix (**applied via sed**) |
-| `mDNSResponder-176.2.uds_daemon.c.p1.patch` | mDNSResponder | `mDNSResponder-176.2` | UDS daemon size assertion fix (**applied via sed**) |
-| `Tokend-35209.MacTypes.patch` | Tokend | `Tokend-35209` | Replace `MacTypes.h` include paths in smart card headers |
+| `at_cmds` | at_cmds | `at_cmds-54` | Define `_OPEN_SOURCE_` to bypass SystemIntegrity.h |
+| `bless` | bless | `bless-63.2` | Xcode project fix for open-source build |
+| boot-132 (DFE) | boot-132 (DFE) | n/a — source gone | DFE bootloader; source unavailable; pre-built root used |
+| `CF` BuildCFLite | CF | `CF-476.15` | Fix `install_name_tool` install path for CoreFoundation |
+| `CF` CFBundle_Resources | CF | `CF-476.15` | CFBundle resource loading fix |
+| `configd` dy_framework.h | configd | `configd-212.2` | Dynamic framework loading header |
+| `configd` SCDPrivate.c | configd | `configd-212.2` | Comment out `CFStringTransform` call missing in PureFoundation |
+| `configd` SCNetworkConnection.c | configd | `configd-212.2` | Network connection API stub |
+| `configd` SCNetworkConnectionPrivate.c | configd | `configd-212.2` | Private connection API cleanup |
+| `configd` SCPrivate.h | configd | `configd-212.2` | Private header adjustment |
+| `configd` SystemConfiguration.h | configd | `configd-212.2` | SC framework public header fix |
+| `dtrace` dtrace_1.c | dtrace | `dtrace-48` | Command-line tool build fix |
+| `dtrace` dt_ld.m | dtrace | `dtrace-48` | Link-editor Objective-C file fix |
+| `dtrace` dt_pid_apple.m | dtrace | `dtrace-48` | PID provider Apple-specific fix |
+| `dtrace` libproc.m | dtrace | `dtrace-48` | Process inspection library fix |
+| `dtrace` libproc_apple.h | dtrace | `dtrace-48` | Apple libproc header compatibility |
+| `dtrace` project.pbxproj | dtrace | `dtrace-48` | Xcode project: add libelf/libdwarf deps |
+| `gnutar` common.h | gnutar | `gnutar-442.0.1` | `common.h` build fix |
+| `IOAudioFamily` | IOAudioFamily | `IOAudioFamily-169.4.3` | KEXT mixer + Info.plist compatibility fix |
+| `iodbc` | iodbc | `iodbc-34` | Makefile build fix for open-source context |
+| `IOHIDFamily` IOHIDDeviceClass.cpp | IOHIDFamily | `IOHIDFamily-258.3` | Add `objc/objc.h` include to fix linkage |
+| `IOHIDFamily` IOHIDQueueClass.cpp | IOHIDFamily | `IOHIDFamily-258.3` | Same include fix for queue class |
+| `IOHIDFamily` IOHIDUPSClass.cpp | IOHIDFamily | `IOHIDFamily-258.3` | Same include fix for UPS class |
+| `IOKitUser` IOAccelSurfaceControl.c | IOKitUser | `IOKitUser-388.2.1` | Accelerator surface control fix |
+| `IOKitUser` IODisplayLib.c | IOKitUser | `IOKitUser-388.2.1` | Display library fix |
+| `IOKitUser` IOGraphicsLib.c | IOKitUser | `IOKitUser-388.2.1` | Graphics library fix |
+| `IOKitUser` IOHIDEventSystem.c | IOKitUser | `IOKitUser-388.2.1` | HID event system fix |
+| `IOKitUser` IOPMAutoWake.c | IOKitUser | `IOKitUser-388.2.1` | Power management auto-wake |
+| `IOKitUser` IOPMEnergyPrefs.c | IOKitUser | `IOKitUser-388.2.1` | Energy preferences |
+| `IOKitUser` IOPMLibPrivate.c | IOKitUser | `IOKitUser-388.2.1` | Private PM library |
+| `IOKitUser` IOPMPowerNotifications.c | IOKitUser | `IOKitUser-388.2.1` | Power notification fix |
+| `IOKitUser` IOPMRepeatingPower.c | IOKitUser | `IOKitUser-388.2.1` | Repeating power event fix |
+| `IOKitUser` IOPMUPSPrefs.c | IOKitUser | `IOKitUser-388.2.1` | UPS preferences fix |
+| `IOKitUser` IOPowerSources.c | IOKitUser | `IOKitUser-388.2.1` | Power source API |
+| `IOKitUser` IOPowerSourcesPrivate.c | IOKitUser | `IOKitUser-388.2.1` | Private power source API |
+| `IOKitUser` IOSystemConfiguration.c | IOKitUser | `IOKitUser-388.2.1` | System configuration |
+| `IOKitUser` IOKitLib.h + GetSymbolFromPEF.h | IOKitUser | `IOKitUser-388.2.1` | IOKitLib.h + GetSymbolFromPEF.h + HID defs fix |
+| `IOKitUser` PEFSupport.c | IOKitUser | `IOKitUser-388.2.1` | PEF binary support |
+| `ipv6configuration` | ipv6configuration | `ipv6configuration-27` | IPv6 service library fix |
+| `kext_tools` bootcaches.c | kext_tools | `kext_tools-117` | Disable BootCache update checks |
+| `kext_tools` globals.h | kext_tools | `kext_tools-117` | Global variable declarations |
+| `kext_tools` kextd_main.c | kext_tools | `kext_tools-117` | kextd startup fix for PureDarwin |
+| `kext_tools` prelink.c | kext_tools | `kext_tools-117` | Prelink fix |
+| `kext_tools` project.pbxproj | kext_tools | `kext_tools-117` | Xcode project fix |
+| `kext_tools` update_boot.c | kext_tools | `kext_tools-117` | Boot update fix |
+| `kext_tools` watchvol.h | kext_tools | `kext_tools-117` | Volume watch header |
+| `launchd` 258.18 launchd.c | launchd | `launchd-258.18` | Remove AppleTalk dependency |
+| `launchd` 258.18 launchproxy | launchd | `launchd-258.18` | Proxy fix |
+| `launchd` 258.18 main | launchd | `launchd-258.18` | SystemStarter + config.h.in fix |
+| `launchd` 258.1 | launchd | `launchd-258.1` | Remove quarantine API dependency (9F33pd1) |
+| `libdwarf` pro_alloc.c | libdwarf | Mirror/libdwarf-8.tar.gz | `malloc.h` → `sys/malloc.h` |
+| `libsecurity_apple_csp` | libsecurity_apple_csp | `libsecurity_apple_csp-35205` | Xcode project fix |
+| `libsecurity_filevault` | libsecurity_filevault | `libsecurity_filevault-28631` | FileVault interface fix |
+| `mDNSResponder` daemon.c | mDNSResponder | `mDNSResponder-176.2` | Add `CarbonCore/MacTypes.h` include |
+| `mDNSResponder` mDNSEmbeddedAPI.h | mDNSResponder | `mDNSResponder-176.2` | Comment out failing size assertions |
+| `mDNSResponder` mDNSMacOSX.c | mDNSResponder | `mDNSResponder-176.2` | macOS-specific daemon fix |
+| `mDNSResponder` uDNS.c | mDNSResponder | `mDNSResponder-176.2` | uDNS size assertion fix |
+| `mDNSResponder` uds_daemon.c | mDNSResponder | `mDNSResponder-176.2` | UDS daemon size assertion fix |
+| `Tokend` MacTypes | Tokend | `Tokend-35209` | Replace `MacTypes.h` include paths in smart card headers |
 
 ---
 
@@ -626,17 +577,11 @@ Two versions of `launchd` are carried:
 ### Build host
 The build pipeline has only been tested on macOS Leopard/Snow Leopard with Xcode 3.x. Building on later macOS requires the MacOSX10.5.sdk which must be manually installed; Apple does not ship it with Xcode 4+.
 
-### mDNSResponder `../` paths
-Three `mDNSResponder` patches reference files via directory traversal paths (e.g., `mDNSMacOSX/../mDNSCore/mDNSEmbeddedAPI.h`). GNU `patch` refuses these as a security measure ("potentially dangerous file name"). `pd_patch_source` applies those three changes as inline `sed` substitutions instead.
-
-### libdwarf archive layout
-The bundled `puredarwin.roots/Mirror/libdwarf-8.tar.gz` contains an extra directory level (`dwarf/`) above the actual `libdwarf/` source directory, and the archive already contains the patched `pro_alloc.c`. `pd_patch_source` handles this transparently; the `--forward` flag causes `patch` to skip the already-applied hunk.
-
 ### boot-132 source is unavailable
 The DFE `boot-132` bootloader source was hosted exclusively on `puredarwin.googlecode.com`, which has been defunct since 2016. The three `boot-132_dfe_*.p0.patch` files are kept for historical reference but cannot be applied. The pre-built `boot.root.tar.gz` in `Roots/9F33pd1/` is used instead.
 
-### Missing patch files for 7 projects
-The following projects are listed in `plists/9J61pd1.plist` as having patches, but the patch files were not archived when this repo was assembled:
+### Missing source changes for 7 projects
+The following projects are listed in `plists/9J61pd1.plist` as having patches, but the corresponding source changes were never recorded and are not present in `source/`:
 - `CFNetwork-129.20` — `CFNetwork-129.20.p1.patch.0`
 - `JavaScriptCore-5525.26.2` — `JavaScriptCore-5525.26.2.p1.patch.0`
 - `Libc-498.1.7` — `Libc-498.1.7.p1.patch.0`
@@ -645,7 +590,7 @@ The following projects are listed in `plists/9J61pd1.plist` as having patches, b
 - `libsecurity_ldap_dl-30174` — `libsecurity_ldap_dl-30174.p1.patch.0`
 - `security_dotmac_tp-33607` — `security_dotmac_tp-33607.p1.patch.{0,1,2}`
 
-Pre-built binary roots for all of these are available in `puredarwin.roots/Roots/`.
+Pre-built binary roots for all of these are available in `puredarwin.roots/Roots/`. If you need to recompile any of them, the patches would need to be reconstructed from the compiled binaries.
 
 ### No network stack in early boot
 The PureDarwin Xmas configuration uses `configd` + `mDNSResponder` for network, but DHCP is not always reliable in VMware without the correct VirtioNet or vmxnet driver. The generated `.vmx` uses `vmxnet` (VMware Para-Virtual NIC), which is supported by the `NotApple80211` stub and the included vmxnet KEXT.
@@ -687,6 +632,6 @@ This repository contains code and binaries under multiple licenses:
 | Chameleon bootloader | Apple Public Source License 2.0 (derived from Apple `boot-132`) |
 | XFree86 / X.Org components (`Roots/X/`) | MIT X11 License |
 | MacPorts packages (`Roots/mp/`) | Various open-source licenses per package |
-| hexley9k additions (this README, `pd_fetch_source`, `pd_patch_source`, `pd_build_source`) | BSD 2-Clause |
+| hexley9k additions (this README, `pd_build_source`) | BSD 2-Clause |
 
 Please read all applicable licenses before redistributing any portion of this software.
