@@ -117,8 +117,30 @@ DARWINBUILD="${DARWINBUILD:-darwinbuild}"
 # Pre-flight checks
 # ---------------------------------------------------------------------------
 if [ "$(uname -s)" != "Darwin" ]; then
-    echo "ERROR: pd_build_source must be run on macOS."
-    exit 1
+    echo "WARNING: pd_build_source is designed for macOS (Leopard/Snow Leopard)."
+    echo "         Running on $(uname -s) is not supported natively."
+    echo ""
+    echo "  Options for building on Linux / WSL / Windows:"
+    echo ""
+    echo "  1. Use a macOS CI runner (GitHub Actions 'macos-*' runner) to compile,"
+    echo "     then download the resulting .root.tar.gz files."
+    echo ""
+    echo "  2. Use a Docker-based macOS cross-compilation toolchain (experimental):"
+    echo "       docker run --rm -v \$(pwd):/repo sickcodes/docker-osx"
+    echo "     Note: macOS SDK licencing restrictions may apply."
+    echo ""
+    echo "  3. Assemble a PureDarwin image from the pre-built roots already"
+    echo "     included in puredarwin.roots/Roots/ — skipping the compile step:"
+    echo "       sudo ./setup/pd_setup_linux puredarwin.vmwarevm PureDarwin"
+    echo ""
+    echo "  Set PD_FORCE_NON_MACOS=1 to override this check and attempt a"
+    echo "  non-macOS build anyway (expect failures without an Apple toolchain)."
+    echo ""
+    if [ "${PD_FORCE_NON_MACOS:-0}" != "1" ]; then
+        exit 1
+    fi
+    echo "  PD_FORCE_NON_MACOS=1 set; proceeding (results may vary)."
+    echo ""
 fi
 
 if [ "$(id -u)" != "0" ]; then

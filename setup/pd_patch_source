@@ -1,0 +1,168 @@
+#!/bin/sh
+#
+# Copyright (c) 2007-2010 The PureDarwin Project.
+# All rights reserved.
+#
+# @LICENSE_HEADER_START@
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+# IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+# THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+# PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+# LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+# NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# @LICENSE_HEADER_END@
+#
+
+#
+# pd_patch_source
+#
+# Applies PureDarwin patches to the Darwin source trees under source/.
+#
+# Each source tree may contain a patches/ subdirectory with one or more
+# *.patch files.  This script finds them and applies them with patch(1)
+# using --forward so that re-running is safe (already-applied patches
+# are silently skipped).
+#
+# This script works on any OS that has patch(1) available.
+# On Windows use WSL, Cygwin, or Git for Windows (which ships patch).
+#
+# Usage:
+#   ./setup/pd_patch_source [project ...]
+#
+# If no project names are given, all source trees are patched.
+# You can patch a single project by naming it (e.g. "gnutar", "libdwarf"):
+#   ./setup/pd_patch_source gnutar libdwarf
+#
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")"; pwd)"
+case "$SCRIPT_DIR" in
+    */setup) REPO_ROOT="$(dirname "$SCRIPT_DIR")" ;;
+    *)       REPO_ROOT="$SCRIPT_DIR" ;;
+esac
+
+SOURCE_DIR="$REPO_ROOT/source"
+
+# ---------------------------------------------------------------------------
+# Pre-flight checks
+# ---------------------------------------------------------------------------
+if ! command -v patch >/dev/null 2>&1; then
+    echo "ERROR: patch(1) is required.  Install patch and try again."
+    echo "  macOS/Darwin : already available"
+    echo "  Ubuntu/Debian: sudo apt-get install patch"
+    echo "  WSL          : sudo apt-get install patch"
+    echo "  Windows      : install Git for Windows (includes patch) or Cygwin"
+    exit 1
+fi
+
+if [ ! -d "$SOURCE_DIR" ]; then
+    echo "ERROR: source/ directory not found at $SOURCE_DIR"
+    echo "Run ./setup/pd_fetch_source first."
+    exit 1
+fi
+
+echo "==> pd_patch_source"
+echo "    Source directory: $SOURCE_DIR"
+echo ""
+
+# ---------------------------------------------------------------------------
+# Helper: apply all patches found in a source tree's patches/ directory.
+#
+# Usage: apply_patches_in <tree_dir> <label>
+# ---------------------------------------------------------------------------
+apply_patches_in() {
+    _tree="$1"
+    _label="${2:-$(basename "$_tree")}"
+    _patch_dir="$_tree/patches"
+
+    if [ ! -d "$_patch_dir" ]; then
+        return 0   # nothing to patch
+    fi
+
+    # Collect patches, sorted lexicographically.
+    _found=0
+    for _patch in $(ls "$_patch_dir"/*.patch "$_patch_dir"/*.diff 2>/dev/null | sort); do
+        _found=1
+        _pname="$(basename "$_patch")"
+        printf "  %-40s applying %s\n" "[$_label]" "$_pname"
+        if patch -d "$_tree" -p1 --forward --batch --silent < "$_patch"; then
+            printf "  %-40s %s\n" "" "OK"
+        else
+            _exit=$?
+            if [ $_exit -eq 1 ]; then
+                # patch returns 1 when all hunks already applied (--forward)
+                printf "  %-40s %s\n" "" "already applied (skipped)"
+            else
+                printf "  %-40s %s\n" "" "ERROR (exit $_exit)"
+                return $_exit
+            fi
+        fi
+    done
+
+    if [ $_found -eq 0 ]; then
+        printf "  %-40s %s\n" "[$_label]" "no *.patch or *.diff files in patches/"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Determine which projects the caller wants to patch.
+# ---------------------------------------------------------------------------
+WANT="$*"
+
+should_patch() {
+    _name="$1"
+    if [ -z "$WANT" ]; then
+        return 0
+    fi
+    for _w in $WANT; do
+        if [ "$_w" = "$_name" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Walk every source tree and apply its patches.
+# ---------------------------------------------------------------------------
+ERRORS=""
+
+for _subroot in "$SOURCE_DIR/apple" "$SOURCE_DIR/third_party"; do
+    [ -d "$_subroot" ] || continue
+    for _tree in "$_subroot"/*/; do
+        [ -d "$_tree" ] || continue
+        _name="$(basename "$_tree")"
+        should_patch "$_name" || continue
+        apply_patches_in "$_tree" "$_name" \
+            || ERRORS="$ERRORS $_name"
+    done
+done
+
+echo ""
+if [ -n "$ERRORS" ]; then
+    echo "==> pd_patch_source finished with errors in:$ERRORS"
+    exit 1
+else
+    echo "==> pd_patch_source complete."
+    echo ""
+    echo "    Next steps:"
+    echo "      macOS:    sudo ./setup/pd_build_source"
+    echo "      Linux/WSL: sudo ./setup/pd_setup_linux output.vmwarevm PureDarwin"
+fi

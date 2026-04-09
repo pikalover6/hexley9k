@@ -1,0 +1,227 @@
+#!/bin/sh
+#
+# Copyright (c) 2007-2010 The PureDarwin Project.
+# All rights reserved.
+#
+# @LICENSE_HEADER_START@
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+# IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+# THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+# PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+# LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+# NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# @LICENSE_HEADER_END@
+#
+
+#
+# pd_fetch_source
+#
+# Fetches Darwin open-source component sources from Apple's GitHub mirror
+# (apple-oss-distributions) at the exact tagged versions targeted by the
+# PureDarwin patches, populating source/apple/.
+#
+# Third-party sources (libdwarf, libelf) are extracted from the bundled
+# archives in puredarwin.roots/Mirror/.
+#
+# This script works on any OS that has git and tar available.
+#
+# Usage:
+#   ./setup/pd_fetch_source [project ...]
+#
+# If no projects are named, all are fetched.  You can fetch a single project:
+#   ./setup/pd_fetch_source CF launchd
+#
+# NOTE: If source/<project> already exists the fetch for that project is
+# skipped.  Delete the directory first if you want a fresh clone.
+#
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")"; pwd)"
+case "$SCRIPT_DIR" in
+    */setup) REPO_ROOT="$(dirname "$SCRIPT_DIR")" ;;
+    *)       REPO_ROOT="$SCRIPT_DIR" ;;
+esac
+
+SOURCE_DIR="$REPO_ROOT/source"
+MIRROR_DIR="$REPO_ROOT/puredarwin.roots/Mirror"
+
+APPLE_GITHUB="https://github.com/apple-oss-distributions"
+
+# ---------------------------------------------------------------------------
+# Pre-flight checks
+# ---------------------------------------------------------------------------
+if ! command -v git >/dev/null 2>&1; then
+    echo "ERROR: git is required.  Install git and try again."
+    exit 1
+fi
+
+if ! command -v tar >/dev/null 2>&1; then
+    echo "ERROR: tar is required.  Install tar and try again."
+    exit 1
+fi
+
+echo "==> pd_fetch_source"
+echo "    Source directory : $SOURCE_DIR"
+echo "    Apple GitHub     : $APPLE_GITHUB"
+echo ""
+
+# ---------------------------------------------------------------------------
+# Helper: clone one Apple project at a specific tag.
+#
+# Usage: fetch_apple_project <project> <tag> <dest_subdir>
+#   dest_subdir is relative to source/apple/ and defaults to <project>
+# ---------------------------------------------------------------------------
+fetch_apple_project() {
+    _project="$1"
+    _tag="$2"
+    _subdir="${3:-$_project}"
+    _dest="$SOURCE_DIR/apple/$_subdir"
+
+    if [ -d "$_dest" ]; then
+        echo "  [skip] source/apple/$_subdir (already present)"
+        return 0
+    fi
+
+    echo "  Cloning $_project @ $_tag ..."
+    git clone --depth 1 --branch "$_tag" \
+        "$APPLE_GITHUB/$_project" "$_dest" \
+        || { echo "  ERROR: failed to clone $_project @ $_tag"; return 1; }
+
+    echo "  [done] source/apple/$_subdir"
+}
+
+# ---------------------------------------------------------------------------
+# Helper: extract a third-party tarball from Mirror/.
+#
+# Usage: fetch_mirror_tarball <archive> <dest_subdir>
+#   dest_subdir is relative to source/third_party/
+# ---------------------------------------------------------------------------
+fetch_mirror_tarball() {
+    _archive="$1"
+    _subdir="$2"
+    _dest="$SOURCE_DIR/third_party/$_subdir"
+
+    if [ -d "$_dest" ]; then
+        echo "  [skip] source/third_party/$_subdir (already present)"
+        return 0
+    fi
+
+    _src="$MIRROR_DIR/$_archive"
+    if [ ! -f "$_src" ]; then
+        echo "  ERROR: Mirror archive not found: $_src"
+        return 1
+    fi
+
+    echo "  Extracting $_archive -> source/third_party/$_subdir ..."
+    mkdir -p "$_dest"
+    tar -xf "$_src" -C "$_dest" --strip-components=1 \
+        || { echo "  ERROR: failed to extract $_archive"; rm -rf "$_dest"; return 1; }
+
+    echo "  [done] source/third_party/$_subdir"
+}
+
+# ---------------------------------------------------------------------------
+# Master list: (project  tag  dest_subdir)
+#
+# dest_subdir is used when the directory name must differ from the project
+# name — e.g. launchd has two versions so they live in different subdirs.
+# ---------------------------------------------------------------------------
+
+# Format: "project tag [dest_subdir]"
+# dest_subdir is optional; if omitted, the project name is used.
+APPLE_PROJECTS="
+at_cmds                  at_cmds-54
+bless                    bless-63.2
+CF                       CF-476.15
+configd                  configd-212.2
+dtrace                   dtrace-48
+gnutar                   gnutar-442.0.1
+IOAudioFamily            IOAudioFamily-169.4.3
+iodbc                    iodbc-34
+IOHIDFamily              IOHIDFamily-258.3
+IOKitUser                IOKitUser-388.2.1
+ipv6configuration        ipv6configuration-27
+kext_tools               kext_tools-117
+launchd                  launchd-258.18           launchd_258.18
+launchd                  launchd-258.1            launchd_258.1
+libsecurity_apple_csp    libsecurity_apple_csp-35205
+libsecurity_filevault    libsecurity_filevault-28631
+mDNSResponder            mDNSResponder-176.2
+Tokend                   Tokend-35209
+"
+
+# Third-party tarballs stored under puredarwin.roots/Mirror/
+MIRROR_TARBALLS="
+libdwarf-8.tar.gz        libdwarf-20081013
+libelf-3.tar.gz          libelf-3
+"
+
+# ---------------------------------------------------------------------------
+# Determine the set of projects to fetch (all unless args are given).
+# ---------------------------------------------------------------------------
+WANT="$*"
+
+should_fetch() {
+    _name="$1"
+    if [ -z "$WANT" ]; then
+        return 0    # fetch everything
+    fi
+    for _w in $WANT; do
+        if [ "$_w" = "$_name" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Fetch Apple projects
+# ---------------------------------------------------------------------------
+mkdir -p "$SOURCE_DIR/apple"
+
+echo "--- Fetching Apple open-source projects ---"
+
+# Parse APPLE_PROJECTS line by line.
+# Lines have 2 or 3 whitespace-separated tokens:  project  tag  [dest_subdir]
+echo "$APPLE_PROJECTS" | while read _proj _tag _subdir; do
+    [ -z "$_proj" ] && continue   # skip blank lines
+    _subdir="${_subdir:-$_proj}"
+    should_fetch "$_proj" || should_fetch "$_subdir" || continue
+    fetch_apple_project "$_proj" "$_tag" "$_subdir"
+done
+
+# ---------------------------------------------------------------------------
+# Fetch third-party tarballs
+# ---------------------------------------------------------------------------
+mkdir -p "$SOURCE_DIR/third_party"
+
+echo ""
+echo "--- Fetching third-party sources from Mirror ---"
+
+echo "$MIRROR_TARBALLS" | while read _archive _subdir; do
+    [ -z "$_archive" ] && continue
+    should_fetch "$_subdir" || continue
+    fetch_mirror_tarball "$_archive" "$_subdir"
+done
+
+echo ""
+echo "==> pd_fetch_source complete."
+echo ""
+echo "    Next: ./setup/pd_patch_source"

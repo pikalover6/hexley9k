@@ -97,10 +97,14 @@ Step A.  Fetch source (any OS, only needs git + tar)
      Third-party sources (libdwarf, libelf) are extracted from the bundled
      archives in puredarwin.roots/Mirror/.
 
+     NOTE: The source/ directory in this repository is already populated with
+     pre-fetched (and pre-patched) sources.  Run pd_fetch_source only when you
+     want a clean re-clone (delete source/ first).
+
 Step B.  Apply patches (any OS, only needs the patch(1) utility)
      ./setup/pd_patch_source
 
-     Applies every patch from patches/ to the corresponding source tree.
+     Applies every patch from patches/ subdirectories within each source tree.
      The --forward flag makes this idempotent; re-running is safe.
 
 Step C.  Build (macOS only -- Leopard/Snow Leopard recommended)
@@ -115,15 +119,51 @@ Step C.  Build (macOS only -- Leopard/Snow Leopard recommended)
      You can build a single project:
        sudo ./setup/pd_build_source kext_tools
 
-Step D.  Assemble the image (macOS only, same as before)
+     Linux / WSL / Windows alternatives (Step C only):
+       * Use a macOS CI runner (e.g. GitHub Actions macos-* runner).
+       * Use a macOS cross-compilation container (experimental):
+           docker run --rm -v $(pwd):/repo sickcodes/docker-osx
+       * Skip Step C entirely and use the pre-built roots already in
+         puredarwin.roots/Roots/ (see Step D-Linux below).
+
+Step D.  Assemble the image (macOS)
      sudo ./setup/pd_setup puredarwin.vmwarevm PureDarwin
      -- or, using the pre-extracted filesystem already in the repo:
      sudo ./setup/pd_setup_prebuilt ../extracted/filesystem/PureDarwinXmas \
           puredarwin.vmwarevm PureDarwin
 
+Step D-Linux / WSL.  Assemble the image on Linux or Windows (WSL2)
+     Required packages (Ubuntu/Debian/WSL2):
+       sudo apt-get install parted hfsprogs genisoimage qemu-utils kpartx rsync
+
+     Then run:
+       sudo ./setup/pd_setup_linux puredarwin.vmwarevm PureDarwin
+       sudo ./setup/pd_setup_linux puredarwin.vmdk      PureDarwin
+       sudo ./setup/pd_setup_linux puredarwin.iso       PureDarwin
+
+     pd_setup_linux replaces all macOS-specific utilities:
+       hdid          -> losetup
+       pdisk         -> parted (mklabel mac)
+       newfs_hfs     -> mkfs.hfsplus
+       mount -t hfs  -> mount -t hfsplus
+       gnutar        -> tar
+       ditto         -> rsync
+       mkisofs       -> genisoimage
+       qemu-img      -> system qemu-img (from qemu-utils)
+       vsdbutil      -> (skipped, no-op on Linux)
+       launchctl     -> (skipped, no-op on Linux)
+       kextcache     -> (skipped, not applicable on Linux)
+       bless         -> (skipped; Chameleon handles BIOS boot without it)
+
+     WSL1 note: loop devices require WSL2.  Add this to %USERPROFILE%\.wslconfig:
+       [wsl2]
+       kernelCommandLine = vsyscall=emulate
+     and ensure loop is loaded:
+       sudo modprobe loop
+
 Binary roots for projects that have no patches (and thus no source in this
 repo) remain available as pre-built archives under puredarwin.roots/Roots/.
-They are used automatically by pd_setup.
+They are used automatically by pd_setup and pd_setup_linux.
 
 Source-to-patch mapping
 -----------------------
