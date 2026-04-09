@@ -1,0 +1,12 @@
+--- Makefile.in.orig	2008-12-08 22:19:50.000000000 -0800
++++ Makefile.in	2008-12-08 22:20:23.000000000 -0800
+@@ -85,6 +85,9 @@
+ 	$(SHELL) $(srcdir)/mkinstalldirs $(instroot)$(pkgdir)
+ 	$(INSTALL_DATA) libelf.pc $(instroot)$(pkgdir)
+ 
++install-strip:
++        ${MAKE} INSTALL_PROGRAM='${INSTALL_PROGRAM} -s' install
++
+ uninstall-local:
+ 	$(RM) $(instroot)$(pkgdir)/libelf.pc
+ 

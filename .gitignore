@@ -2,10 +2,6 @@
 # hexley9k – gitignore
 # -----------------------------------------------------------------------
 
-# Darwin source trees fetched by setup/pd_fetch_source.
-# Not committed; reconstructed at build time from apple-oss-distributions.
-source/
-
 # Extracted PureDarwin Xmas filesystem tree.
 # 455 MB / 29k files — too large for regular git.
 # Reconstruct on macOS with: sudo ./setup/pd_setup_prebuilt

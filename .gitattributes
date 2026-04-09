@@ -12,3 +12,5 @@ projects/PureDarwinPackageDatabase/pdpd filter=lfs diff=lfs merge=lfs -text
 projects/PureDarwinPackageDatabase/tools/pdpdmake filter=lfs diff=lfs merge=lfs -text
 projects/PureDarwinPackageDatabase/tools/dbaudit filter=lfs diff=lfs merge=lfs -text
 projects/PureDarwinPackageDatabase/tools/dbstats filter=lfs diff=lfs merge=lfs -text
+source/apple/gnutar/tar-1.15.1.tar.bz2 filter=lfs diff=lfs merge=lfs -text
+source/third_party/libdwarf-20081013/libdwarf-20081013.tar.gz filter=lfs diff=lfs merge=lfs -text
