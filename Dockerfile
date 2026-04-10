@@ -55,11 +55,18 @@ RUN git clone --depth 1 https://github.com/nicowillis/ldid /opt/ldid-src \
  && cp ldid /opt/cctools/bin/
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STAGE 2: Assemble Darwin 9 SDK headers
-# Sources:
-#   • XNU 1228.15.4  (darwin 9.7.0 = macOS 10.5.7) – mach/, sys/, kern/, libkern/
-#   • Libc 498.1.7   – <stdarg.h>, <stdio.h> Darwin extensions
-#   • project headers already present in /repo/source/apple/{CF,IOKitUser,...}
+# STAGE 2: Assemble Darwin 9 SDK headers entirely from in-repo sources
+#
+# All header archives are already committed in puredarwin.roots/Roots/:
+#
+#   Roots/pd/xnu.root.tar.gz
+#     usr/include/{mach,sys,libkern,i386,bsm,device,isofs,...}  (≈ 391 headers)
+#     System/Library/Frameworks/IOKit.framework/…/Headers/      (≈ 18 headers)
+#
+#   Roots/9F33pd1/objc4.root.tar.gz
+#     usr/include/objc/                                          (≈ 16 headers)
+#
+# No network access is required; no Apple repositories are cloned.
 # ─────────────────────────────────────────────────────────────────────────────
 FROM ubuntu:22.04 AS sdk-assembler
 LABEL stage=sdk-assembler
@@ -67,46 +74,40 @@ LABEL stage=sdk-assembler
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git ca-certificates make \
+    tar gzip \
     && rm -rf /var/lib/apt/lists/*
 
 ENV SDK=/opt/darwin9-sdk
 
-# Fetch XNU kernel headers (Darwin 9.7.0 = XNU 1228.15.4)
-# Both tags point to the same source; the ".0.1" suffix is the macOS build number
-# used on some mirrors.  We try the shorter form first.
-RUN git clone --depth 1 \
-        --branch xnu-1228.15.4 \
-        https://github.com/apple-oss-distributions/xnu \
-        /tmp/xnu \
- || git clone --depth 1 \
-        --branch xnu-1228.15.4.0.1 \
-        https://github.com/apple-oss-distributions/xnu \
-        /tmp/xnu
+# Copy the two root archives that carry the SDK headers into this stage.
+# (We can't use COPY --from=context at build time without BuildKit context,
+#  so we add them with COPY.  The build context is the repo root.)
+COPY puredarwin.roots/Roots/pd/xnu.root.tar.gz    /tmp/xnu.root.tar.gz
+COPY puredarwin.roots/Roots/9F33pd1/objc4.root.tar.gz /tmp/objc4.root.tar.gz
 
-# Install XNU exported headers into the SDK.
-# 'make exporthdrs' writes to DSTROOT; we point it at $SDK.
-RUN cd /tmp/xnu \
- && make exporthdrs DSTROOT="$SDK" 2>/dev/null || true \
- # Fallback: copy the EXPORT_FILES manually if make exporthdrs not available.
- && mkdir -p "$SDK/usr/include" \
- && cp -r osfmk/mach         "$SDK/usr/include/mach"         2>/dev/null || true \
- && cp -r osfmk/machine      "$SDK/usr/include/machine"      2>/dev/null || true \
- && cp -r bsd/sys            "$SDK/usr/include/sys"          2>/dev/null || true \
- && cp -r bsd/machine        "$SDK/usr/include/bsd-machine"  2>/dev/null || true \
- && cp -r libkern/libkern    "$SDK/usr/include/libkern"      2>/dev/null || true \
- && cp -r iokit/IOKit        "$SDK/usr/include/IOKit"        2>/dev/null || true \
- && rm -rf /tmp/xnu
+# Extract the kernel headers from xnu.root.tar.gz.
+# The archive lays out:
+#   ./usr/include/{mach,sys,libkern,i386,bsm,...}  — kernel API headers
+#   ./System/Library/Frameworks/IOKit.framework/Versions/A/Headers/  — IOKit headers
+# We extract both subtrees then copy the IOKit headers into usr/include/IOKit.
+RUN mkdir -p "$SDK" \
+ && tar xzf /tmp/xnu.root.tar.gz -C "$SDK" \
+        --wildcards './usr/include/*' './System/Library/Frameworks/IOKit.framework/*' \
+        2>/dev/null || true \
+ # Copy IOKit framework headers into usr/include/IOKit so that code using
+ # -I$SDK/usr/include can find <IOKit/IOKitLib.h> etc.
+ && IOK="$SDK/System/Library/Frameworks/IOKit.framework/Versions/A/Headers" \
+ && if [ -d "$IOK" ]; then \
+        mkdir -p "$SDK/usr/include/IOKit" ; \
+        cp -r "$IOK/." "$SDK/usr/include/IOKit/" ; \
+    fi \
+ && rm /tmp/xnu.root.tar.gz
 
-# Fetch Libc 498.1.7 for Darwin-extended stdlib / POSIX headers.
-RUN git clone --depth 1 \
-        --branch Libc-498.1.7 \
-        https://github.com/apple-oss-distributions/Libc \
-        /tmp/Libc \
- && mkdir -p "$SDK/usr/include" \
- && cp -r /tmp/Libc/include/*  "$SDK/usr/include/" 2>/dev/null || true \
- && cp -r /tmp/Libc/gen/*.h    "$SDK/usr/include/" 2>/dev/null || true \
- && rm -rf /tmp/Libc
+# Add Objective-C runtime headers from objc4.root.tar.gz.
+RUN tar xzf /tmp/objc4.root.tar.gz -C "$SDK" \
+        --wildcards './usr/include/objc/*' \
+        2>/dev/null || true \
+ && rm /tmp/objc4.root.tar.gz
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STAGE 3: Full build environment
