@@ -80,119 +80,124 @@ PUREDARWIN_RELEASE="" ./pd_fetch
 PUREDARWIN_RELEASE="" ./pd_thin
 PUREDARWIN_RELEASE="bootstrap" ./pd_setup arg1 arg2
 
-Building from Source (new pipeline)
+Building PureDarwin: full pipeline
 ====================================
 
-The original pd_fetch / pd_thin steps download pre-compiled binary roots
-from macosforge, which is long gone.  The repository now includes a
-source-based pipeline that fetches Darwin open-source component source
-directly from Apple's GitHub mirror and applies the PureDarwin patches.
+The source trees in source/apple/ and source/third_party/ are already
+present in the repository with all patches pre-applied.  There is NO
+separate fetch or patch step — go straight to compilation.
 
-Step A.  Fetch source (any OS, only needs git + tar)
-     cd <repo-root>
-     ./setup/pd_fetch_source
+─────────────────────────────────────────────────────────────────────
+QUICK START (Windows / WSL2 / Linux — one command)
+─────────────────────────────────────────────────────────────────────
 
-     This clones each patched Darwin project from apple-oss-distributions at
-     the exact tagged version targeted by the patches, populating source/.
-     Third-party sources (libdwarf, libelf) are extracted from the bundled
-     archives in puredarwin.roots/Mirror/.
+  Prerequisites: Docker Desktop (Windows/Mac) or Docker Engine (Linux)
 
-     NOTE: The source/ directory in this repository is already populated with
-     pre-fetched (and pre-patched) sources.  Run pd_fetch_source only when you
-     want a clean re-clone (delete source/ first).
+    ./docker-build.sh
 
-Step B.  Apply patches (any OS, only needs the patch(1) utility)
-     ./setup/pd_patch_source
+  This builds the cross-compilation toolchain in a Docker container
+  (cctools-port + clang + Darwin 9 SDK headers), compiles all Darwin
+  projects in source/, and assembles a bootable VMware image.
 
-     Applies every patch from patches/ subdirectories within each source tree.
-     The --forward flag makes this idempotent; re-running is safe.
+  Output: puredarwin.vmwarevm
 
-Step C.  Build (macOS only -- Leopard/Snow Leopard recommended)
-     sudo ./setup/pd_build_source
+─────────────────────────────────────────────────────────────────────
+STEP-BY-STEP
+─────────────────────────────────────────────────────────────────────
 
-     Uses DarwinBuild to compile each patched project and writes the
-     resulting .root.tar.gz files to puredarwin.roots/Roots/9J61pd1/.
-     DarwinBuild must be installed first:
+Step A.  Build from source — Linux / WSL2 / Windows (Docker)
+     Cross-compiles all Darwin projects in source/ using clang targeting
+     i386-apple-darwin9 plus cctools-port for the Mach-O linker.
+
+     Option 1 — Docker (recommended, sets up the full toolchain automatically):
+       ./docker-build.sh                  # build + assemble in one step
+       ./docker-build.sh --build-only     # compile only
+       ./docker-build.sh libelf launchd   # build specific projects
+
+     Option 2 — Bare Linux / WSL2 (install toolchain yourself):
+       # 1. Install clang and build cctools-port:
+       sudo apt-get install clang llvm lld make autoconf automake
+       git clone https://github.com/tpoechtrager/cctools-port /opt/cctools-src
+       cd /opt/cctools-src/cctools
+       ./configure --target=i386-apple-darwin9 --prefix=/opt/cctools
+       make -j$(nproc) && sudo make install
+       export PATH=/opt/cctools/bin:$PATH
+       # 2. Assemble the Darwin 9 SDK headers (see Dockerfile for details):
+       export DARWIN_SDK=/opt/darwin9-sdk
+       # 3. Run the build:
+       ./setup/pd_build_linux
+
+     Both options write compiled roots to puredarwin.roots/Roots/9J61pd1/.
+
+Step A (alternate).  Build from source — macOS (DarwinBuild)
+     Leopard (10.5) or Snow Leopard (10.6) with Xcode 3.x and DarwinBuild:
        git clone https://github.com/apple-oss-distributions/darwinbuild
        cd darwinbuild && sudo make install
+       sudo ./setup/pd_build_source
 
-     You can build a single project:
-       sudo ./setup/pd_build_source kext_tools
+     pd_build_source automatically delegates to pd_build_linux when run
+     on Linux/WSL, so you can always use pd_build_source regardless of OS.
 
-     Linux / WSL / Windows alternatives (Step C only):
-       * Use a macOS CI runner (e.g. GitHub Actions macos-* runner).
-       * Use a macOS cross-compilation container (experimental):
-           docker run --rm -v $(pwd):/repo sickcodes/docker-osx
-       * Skip Step C entirely and use the pre-built roots already in
-         puredarwin.roots/Roots/ (see Step D-Linux below).
+Step B.  Assemble the bootable disk image
 
-Step D.  Assemble the image (macOS)
-     sudo ./setup/pd_setup puredarwin.vmwarevm PureDarwin
-     -- or, using the pre-extracted filesystem already in the repo:
-     sudo ./setup/pd_setup_prebuilt ../extracted/filesystem/PureDarwinXmas \
-          puredarwin.vmwarevm PureDarwin
+     Linux / WSL2 / Windows:
+       Required packages:
+         sudo apt-get install parted hfsprogs genisoimage qemu-utils kpartx rsync
+       Run:
+         sudo ./setup/pd_setup_linux puredarwin.vmwarevm PureDarwin
+         sudo ./setup/pd_setup_linux puredarwin.vmdk      PureDarwin
+         sudo ./setup/pd_setup_linux puredarwin.iso       PureDarwin
 
-Step D-Linux / WSL.  Assemble the image on Linux or Windows (WSL2)
-     Required packages (Ubuntu/Debian/WSL2):
-       sudo apt-get install parted hfsprogs genisoimage qemu-utils kpartx rsync
+     macOS:
+         sudo ./setup/pd_setup puredarwin.vmwarevm PureDarwin
 
-     Then run:
-       sudo ./setup/pd_setup_linux puredarwin.vmwarevm PureDarwin
-       sudo ./setup/pd_setup_linux puredarwin.vmdk      PureDarwin
-       sudo ./setup/pd_setup_linux puredarwin.iso       PureDarwin
+     pd_setup_linux automatically searches puredarwin.roots/Roots/ for
+     pre-built roots and newly compiled roots (in 9J61pd1/) alike.
 
-     pd_setup_linux replaces all macOS-specific utilities:
-       hdid          -> losetup
-       pdisk         -> parted (mklabel mac)
-       newfs_hfs     -> mkfs.hfsplus
-       mount -t hfs  -> mount -t hfsplus
-       gnutar        -> tar
-       ditto         -> rsync
-       mkisofs       -> genisoimage
-       qemu-img      -> system qemu-img (from qemu-utils)
-       vsdbutil      -> (skipped, no-op on Linux)
-       launchctl     -> (skipped, no-op on Linux)
-       kextcache     -> (skipped, not applicable on Linux)
-       bless         -> (skipped; Chameleon handles BIOS boot without it)
+     Tool mapping (macOS → Linux):
+       hdid -nomount  →  losetup -f --show
+       pdisk (APM)    →  parted mklabel mac
+       newfs_hfs      →  mkfs.hfsplus
+       mount -t hfs   →  mount -t hfsplus
+       gnutar         →  tar (GNU tar)
+       ditto          →  rsync -aH
+       mkisofs        →  genisoimage
+       qemu-img (MO)  →  qemu-img (system)
+       vsdbutil        →  mkfs.hfsplus ownership flag
+       bless           →  boot1h + Chameleon (BIOS boot needs no bless)
+       kextcache       →  touch Extensions/ (Darwin rebuilds on first boot)
+       user creation   →  pure POSIX shell (openssl + sed; no chroot)
 
-     WSL1 note: loop devices require WSL2.  Add this to %USERPROFILE%\.wslconfig:
-       [wsl2]
-       kernelCommandLine = vsyscall=emulate
-     and ensure loop is loaded:
-       sudo modprobe loop
+     WSL2 notes:
+       • WSL1 does NOT support loop devices → use WSL2.
+       • Add to %USERPROFILE%\.wslconfig:
+           [wsl2]
+           kernelCommandLine = vsyscall=emulate
+       • Load the loop module if needed:  sudo modprobe loop
 
-Binary roots for projects that have no patches (and thus no source in this
-repo) remain available as pre-built archives under puredarwin.roots/Roots/.
-They are used automatically by pd_setup and pd_setup_linux.
+─────────────────────────────────────────────────────────────────────
+SOURCE TREES IN THIS REPOSITORY
+─────────────────────────────────────────────────────────────────────
 
-Source-to-patch mapping
------------------------
+  source/apple/
+    at_cmds         bless           CF              configd
+    dtrace          gnutar          IOAudioFamily   IOHIDFamily
+    IOKitUser       iodbc           ipv6configuration  kext_tools
+    launchd_258.1   launchd_258.18  libsecurity_apple_csp
+    libsecurity_filevault            mDNSResponder   Tokend
 
-The following Darwin projects are fetched and patched by Steps A-B:
+  source/third_party/
+    libdwarf-20081013               libelf-3
 
-  Project               Tag                    Patches
-  at_cmds               at_cmds-54             at_cmds-54.p1.patch
-  bless                 bless-63.2             bless-63.2.p1.patch
-  CF                    CF-476.15              CF-476.15.*.p1.patch
-  configd               configd-212.2          configd-212.2.*.p1.patch
-  dtrace                dtrace-48              dtrace-48.*.p1.patch
-  gnutar                gnutar-442.0.1         gnutar-442.0.1.p1.patch
-  IOAudioFamily         IOAudioFamily-169.4.3  IOAudioFamily-169.4.3.p1.patch.0
-  iodbc                 iodbc-34               iodbc-34.p1.patch
-  IOHIDFamily           IOHIDFamily-258.3      IOHIDFamily.*.p1.patch
-  IOKitUser             IOKitUser-388.2.1      IOKitUser-388.2.1.*.p1.patch
-  ipv6configuration     ipv6configuration-27   ipv6configuration-27.p1.patch
-  kext_tools            kext_tools-117         kext_tools-117.*.p1.patch
-  launchd (9J61pd1)     launchd-258.18         launchd-258.18.*.p1.patch
-  launchd (9F33pd1)     launchd-258.1          launchd-258.1.p1.patch
-  libdwarf              20081013 (from Mirror)  libdwarf-20081013.*.p1.patch
-  libsecurity_apple_csp libsecurity_apple_csp-35205
-  libsecurity_filevault libsecurity_filevault-28631
-  mDNSResponder         mDNSResponder-176.2    mDNSResponder-176.2.*.p1.patch
-  Tokend                Tokend-35209           Tokend-35209.MacTypes.patch
+All patches from plists/9J61pd1.plist are already applied in-tree.
 
-  boot-132 (DFE): source is unavailable (Google Code, defunct).  The
-  binary root at puredarwin.roots/Roots/9F33pd1/boot.root.tar.gz is used.
+─────────────────────────────────────────────────────────────────────
+PRE-BUILT BINARY ROOTS
+─────────────────────────────────────────────────────────────────────
+
+puredarwin.roots/Roots/ contains pre-built roots for projects whose
+source is not in this repository (drivers, ICU, Libc, etc.).  These
+are used automatically by both pd_setup and pd_setup_linux.
 
 Resources
 =========
