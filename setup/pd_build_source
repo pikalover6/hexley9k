@@ -117,8 +117,16 @@ DARWINBUILD="${DARWINBUILD:-darwinbuild}"
 # Pre-flight checks
 # ---------------------------------------------------------------------------
 if [ "$(uname -s)" != "Darwin" ]; then
-    echo "ERROR: pd_build_source must be run on macOS."
-    exit 1
+    echo "NOTE: pd_build_source targets macOS + DarwinBuild."
+    echo "      On Linux / WSL / Windows, delegating to pd_build_linux..."
+    echo ""
+    echo "  pd_build_linux cross-compiles every Darwin project in source/ to"
+    echo "  Mach-O i386 using clang targeting i386-apple-darwin9 + cctools-port."
+    echo "  The Dockerfile sets up the full toolchain automatically."
+    echo ""
+    echo "  For a one-command Docker build:  ./docker-build.sh"
+    echo ""
+    exec "$SCRIPT_DIR/pd_build_linux" "$@"
 fi
 
 if [ "$(id -u)" != "0" ]; then

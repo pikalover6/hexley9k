@@ -1,0 +1,855 @@
+#!/bin/sh
+#
+# Copyright (c) 2007-2010 The PureDarwin Project.
+# All rights reserved.
+#
+# @LICENSE_HEADER_START@
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+# IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+# THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+# PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+# LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+# NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# @LICENSE_HEADER_END@
+#
+
+#
+# pd_build_linux
+#
+# Cross-compiles every patched Darwin project in source/ on Linux (or WSL2)
+# using clang + cctools-port targeting i386-apple-darwin9, then packages
+# the results into .root.tar.gz files in puredarwin.roots/Roots/9J61pd1/.
+#
+# This script is designed to run INSIDE the Docker container produced by the
+# repo's Dockerfile, which already has the toolchain and Darwin SDK set up.
+# It can also run directly on any Linux / WSL2 system where the required
+# tools are installed manually (see Prerequisites below).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Prerequisites (handled automatically by the Dockerfile):
+#   • clang  ≥ 11  with -target i386-apple-darwin9 support
+#   • cctools-port  (https://github.com/tpoechtrager/cctools-port)
+#     Provides: i386-apple-darwin9-{ld,ar,ranlib,strip,lipo,otool,nm}
+#   • Darwin 9 SDK headers in $DARWIN_SDK (default /opt/darwin9-sdk)
+#     Assembled from XNU 1228.15.4 + Libc 498.1.7 + project headers
+#   • Standard build tools: make, autoconf, automake
+#
+# Manual installation on Ubuntu/Debian (without Docker):
+#   sudo apt-get install clang llvm lld make autoconf automake
+#   # Build cctools-port:
+#   git clone https://github.com/tpoechtrager/cctools-port /opt/cctools-src
+#   cd /opt/cctools-src/cctools
+#   ./configure --target=i386-apple-darwin9 --prefix=/opt/cctools
+#   make -j$(nproc) && sudo make install
+#   export PATH=/opt/cctools/bin:$PATH
+#   # Set up SDK (see Dockerfile for header assembly steps)
+#   export DARWIN_SDK=/opt/darwin9-sdk
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Usage:
+#   ./setup/pd_build_linux                 # build all patched projects
+#   ./setup/pd_build_linux libelf libdwarf # build specific projects
+#
+# Output: puredarwin.roots/Roots/9J61pd1/<project>.root.tar.gz
+#
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")"; pwd)"
+case "$SCRIPT_DIR" in
+    */setup) REPO_ROOT="$(dirname "$SCRIPT_DIR")" ;;
+    *)       REPO_ROOT="$SCRIPT_DIR" ;;
+esac
+
+SRC_APPLE="$REPO_ROOT/source/apple"
+SRC_THIRD="$REPO_ROOT/source/third_party"
+ROOTS_OUT="$REPO_ROOT/puredarwin.roots/Roots/9J61pd1"
+BUILD_DIR="/tmp/pd_build_linux_$$"
+BUILD_LOG_DIR="$REPO_ROOT/puredarwin.roots/Roots/9J61pd1/build-logs"
+
+# Set PD_BUILD_VERBOSE=1 to see full compiler output instead of tail-5.
+PD_BUILD_VERBOSE="${PD_BUILD_VERBOSE:-0}"
+
+_cc_run() {
+    # Run a compiler command, logging full output; on failure print tail of log.
+    _log="$1"; shift
+    "$@" > "$_log" 2>&1 || {
+        echo "  FAILED: $*"
+        if [ "$PD_BUILD_VERBOSE" = "1" ]; then
+            cat "$_log"
+        else
+            echo "  --- last 10 lines (set PD_BUILD_VERBOSE=1 for full output) ---"
+            tail -10 "$_log"
+        fi
+        return 1
+    }
+}
+
+# Darwin target triple and SDK path (can be overridden in the environment)
+DARWIN_TARGET="${DARWIN_TARGET:-i386-apple-darwin9}"
+DARWIN_SDK="${DARWIN_SDK:-/opt/darwin9-sdk}"
+TOOLCHAIN_PREFIX="${TOOLCHAIN_PREFIX:-/opt/cctools/bin}"
+
+# CC/CXX must be a single executable path for autoconf; flags go in CFLAGS.
+# The Dockerfile installs wrapper scripts darwin9-cc / darwin9-c++ that
+# embed the -target / --sysroot flags automatically.  Outside Docker, fall
+# back to bare clang and put the target flags in CFLAGS / CXXFLAGS.
+if command -v darwin9-cc >/dev/null 2>&1; then
+    CC="${DARWIN_CC:-darwin9-cc}"
+    CXX="${DARWIN_CXX:-darwin9-c++}"
+    TARGET_CFLAGS=""
+else
+    CC="${DARWIN_CC:-clang}"
+    CXX="${DARWIN_CXX:-clang++}"
+    TARGET_CFLAGS="-target $DARWIN_TARGET -mmacosx-version-min=10.5 --sysroot $DARWIN_SDK"
+fi
+
+LD="${DARWIN_LD:-$TOOLCHAIN_PREFIX/${DARWIN_TARGET}-ld}"
+AR="${DARWIN_AR:-$TOOLCHAIN_PREFIX/${DARWIN_TARGET}-ar}"
+RANLIB="${DARWIN_RANLIB:-$TOOLCHAIN_PREFIX/${DARWIN_TARGET}-ranlib}"
+STRIP="${DARWIN_STRIP:-$TOOLCHAIN_PREFIX/${DARWIN_TARGET}-strip}"
+
+export CC CXX LD AR RANLIB STRIP
+
+# Extra include path: framework headers assembled from source trees
+EXTRA_CFLAGS="$TARGET_CFLAGS -I$SRC_APPLE/CF -I$SRC_APPLE/IOKitUser -I$DARWIN_SDK/usr/include"
+
+################################################################################
+# PREFLIGHT CHECKS
+################################################################################
+
+echo "==> pd_build_linux"
+echo "    Target  : $DARWIN_TARGET"
+echo "    SDK     : $DARWIN_SDK"
+echo "    CC      : $CC"
+echo "    LD      : $LD"
+echo "    CFLAGS  : $EXTRA_CFLAGS"
+echo ""
+
+check_tool() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "ERROR: '$1' not found."
+        echo "  Either run this inside the Docker container  (./docker-build.sh)"
+        echo "  or install the tool manually:  $2"
+        exit 1
+    fi
+}
+
+check_tool clang          "apt-get install clang"
+check_tool make           "apt-get install build-essential"
+check_tool autoconf       "apt-get install autoconf"
+
+if ! $CC -x c -E - < /dev/null >/dev/null 2>&1 <<'EOF'
+int main() { return 0; }
+EOF
+then
+    echo "WARNING: Test compile with '$CC' failed."
+    echo "  The Darwin SDK at $DARWIN_SDK may be incomplete."
+    echo "  Build will continue but individual projects may fail."
+fi
+
+mkdir -p "$ROOTS_OUT"
+mkdir -p "$BUILD_DIR"
+mkdir -p "$BUILD_LOG_DIR"
+
+################################################################################
+# HELPER FUNCTIONS
+################################################################################
+
+# Run an autoconf project against the Darwin cross-compiler.
+#   build_autoconf <src_dir> <project_name> [extra_configure_args...]
+build_autoconf() {
+    _src="$1"; _name="$2"; shift 2
+    _bdir="$BUILD_DIR/$_name"
+    _dstroot="$BUILD_DIR/${_name}-DSTROOT"
+    mkdir -p "$_bdir" "$_dstroot"
+
+    # Export CC/CXX as environment variables so that configure picks them up
+    # without treating them as host-triple positional arguments.
+    echo "  Running ./configure"
+    (cd "$_bdir" && \
+     env \
+         CC="$CC" CXX="$CXX" \
+         CFLAGS="$EXTRA_CFLAGS" CXXFLAGS="$EXTRA_CFLAGS" \
+         LDFLAGS="-L$DARWIN_SDK/usr/lib" \
+         AR="$AR" RANLIB="$RANLIB" STRIP="$STRIP" \
+     "$_src/configure" \
+         --host="$DARWIN_TARGET" \
+         --build="$(gcc -dumpmachine 2>/dev/null || echo x86_64-linux-gnu)" \
+         --prefix=/usr \
+         "$@")
+
+    echo "  Running make"
+    make -C "$_bdir" -j"$(nproc)"
+
+    echo "  Running make install"
+    make -C "$_bdir" install DESTDIR="$_dstroot"
+
+    package_root "$_name" "$_dstroot"
+}
+
+# Compile a set of C files directly with clang (for projects without autoconf).
+#   build_c_files <project_name> <dstroot_populate_function>
+# The caller must define a function named "populate_<project_name>_dstroot"
+# that receives the DSTROOT path as $1 and populates it.
+build_c_files() {
+    _name="$1"
+    _dstroot="$BUILD_DIR/${_name}-DSTROOT"
+    mkdir -p "$_dstroot"
+    "populate_${_name}_dstroot" "$_dstroot"
+    package_root "$_name" "$_dstroot"
+}
+
+# Package a DSTROOT directory into a .root.tar.gz in ROOTS_OUT.
+#   package_root <project_name> <dstroot_path>
+package_root() {
+    _name="$1"
+    _dstroot="$2"
+    _out="$ROOTS_OUT/${_name}.root.tar.gz"
+    echo "  Packaging -> $( basename "$_out" )"
+    tar czpf "$_out" -C "$_dstroot" .
+    echo "  [done] $_out"
+}
+
+################################################################################
+# BUILD FUNCTIONS — one per project
+################################################################################
+
+build_libelf() {
+    echo "=== Building: libelf ==="
+    _src="$SRC_THIRD/libelf-3/libelf"
+    [ -d "$_src" ] || { echo "  SKIP: source not found at $_src"; return 0; }
+    build_autoconf "$_src" libelf \
+        --enable-shared --enable-static \
+        --includedir=/usr/include
+}
+
+build_libdwarf() {
+    echo "=== Building: libdwarf ==="
+    _src="$SRC_THIRD/libdwarf-20081013"
+    [ -d "$_src" ] || { echo "  SKIP: source not found at $_src"; return 0; }
+
+    _bdir="$BUILD_DIR/libdwarf"
+    _dstroot="$BUILD_DIR/libdwarf-DSTROOT"
+    mkdir -p "$_dstroot/usr/lib" "$_dstroot/usr/include" "$_dstroot/usr/bin"
+
+    # libdwarf uses its own non-autoconf Makefile; invoke it with cross-compile vars.
+    _log="$_bdir/build.log"
+    make -C "$_src" \
+        SRCROOT="$_src" \
+        OBJROOT="$_bdir" \
+        DSTROOT="$_dstroot" \
+        CC="$CC" \
+        RC_CFLAGS="$EXTRA_CFLAGS" \
+        -j"$(nproc)" > "$_log" 2>&1 || { echo "  make failed (see $_log)"; cat "$_log" | tail -20; }
+
+    package_root libdwarf "$_dstroot"
+}
+
+build_gnutar() {
+    echo "=== Building: gnutar ==="
+    _src="$SRC_APPLE/gnutar/gnutar"
+    [ -d "$_src" ] || { echo "  SKIP: source not found at $_src"; return 0; }
+    build_autoconf "$_src" gnutar \
+        --program-prefix=gnu \
+        --includedir=/usr/local/include
+}
+
+build_iodbc() {
+    echo "=== Building: iodbc ==="
+    _src="$SRC_APPLE/iodbc/iodbc"
+    [ -d "$_src" ] || { echo "  SKIP: source not found at $_src"; return 0; }
+    build_autoconf "$_src" iodbc \
+        --disable-gui \
+        --with-iodbc-inidir=/etc \
+        --with-pthreads
+}
+
+build_CF() {
+    echo "=== Building: CF (CoreFoundation) ==="
+    _src="$SRC_APPLE/CF"
+    [ -d "$_src" ] || { echo "  SKIP: source not found at $_src"; return 0; }
+
+    _bdir="$BUILD_DIR/CF"
+    _dstroot="$BUILD_DIR/CF-DSTROOT"
+    _objbase="$_bdir/objects"
+    mkdir -p "$_objbase/normal" "$_objbase/CoreFoundation" "$_dstroot"
+
+    # CoreFoundation uses Objective-C + C, compiles to a single .dylib.
+    # We omit -arch flags (single i386 target) and replace GCC-only flags.
+    _all_c=$(cd "$_src" && ls ./*.c)
+
+    # Copy headers for -I
+    cp "$_src/"*.h "$_objbase/CoreFoundation/"
+
+    _cflags="$EXTRA_CFLAGS \
+        -I$_objbase \
+        -c -pipe -std=gnu99 -g -Wno-deprecated-declarations \
+        -mmacosx-version-min=10.5 \
+        -DCF_BUILDING_CF=1 -DDEPLOYMENT_TARGET_MACOSX=1 \
+        -DMAC_OS_X_VERSION_MAX_ALLOWED=MAC_OS_X_VERSION_10_5 \
+        -DU_SHOW_DRAFT_API=1 -DVERSION=476.10 -O2"
+
+    echo "  Compiling CF sources..."
+    _objs=""
+    for _f in $_all_c; do
+        _base=$(basename "$_f" .c)
+        _obj="$_objbase/normal/${_base}.o"
+        _log="$BUILD_LOG_DIR/CF-${_base}.log"
+        _cc_run "$_log" \
+            $CC $_cflags "$_src/$_f" -o "$_obj" || true
+        _objs="$_objs $_obj"
+    done
+
+    _unicode=""
+    case "$(uname -m)" in
+        i386|i686) _unicode="CFUnicodeData-L.mapping" ;;
+        *)         _unicode="CFUnicodeData-L.mapping" ;;  # default to little-endian
+    esac
+
+    echo "  Linking CoreFoundation.dylib..."
+    _log="$BUILD_LOG_DIR/CF-link.log"
+    _cc_run "$_log" \
+        $CC -dynamiclib \
+        -mmacosx-version-min=10.5 \
+        -install_name /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation \
+        -compatibility_version 150 \
+        -current_version 476 \
+        -Wl,-segcreate,__UNICODE,__csbitmaps,"$_src/CFCharacterSetBitmaps.bitmap" \
+        -Wl,-segcreate,__UNICODE,__properties,"$_src/CFUniCharPropertyDatabase.data" \
+        -Wl,-segcreate,__UNICODE,__data,"$_src/$_unicode" \
+        $_objs \
+        -licucore \
+        -lobjc \
+        -o "$_objbase/CoreFoundation" || true
+
+    # Install into a framework layout.
+    _fwroot="$_dstroot/System/Library/Frameworks/CoreFoundation.framework"
+    mkdir -p "$_fwroot/Versions/A/Headers" \
+             "$_fwroot/Versions/A/PrivateHeaders" \
+             "$_fwroot/Versions/A/Resources/en.lproj"
+    ln -sf A          "$_fwroot/Versions/Current"
+    ln -sf Versions/Current/Headers        "$_fwroot/Headers"
+    ln -sf Versions/Current/PrivateHeaders "$_fwroot/PrivateHeaders"
+    ln -sf Versions/Current/Resources      "$_fwroot/Resources"
+    ln -sf Versions/Current/CoreFoundation "$_fwroot/CoreFoundation"
+
+    cp "$_src/Info.plist" "$_fwroot/Versions/A/Resources/"
+
+    # Public headers
+    for _h in CFArray CFBag CFBase CFBinaryHeap CFBitVector CFBundle CFByteOrder \
+               CFCalendar CFCharacterSet CFData CFDate CFDateFormatter CFDictionary \
+               CFError CFLocale CFMachPort CFMessagePort CFNumber CFNumberFormatter \
+               CFPlugIn CFPlugInCOM CFPreferences CFPropertyList CFRunLoop CFSet \
+               CFSocket CFStream CFString CFStringEncodingExt CFTimeZone CFTree \
+               CFURL CFURLAccess CFUUID CFUserNotification CFXMLNode CFXMLParser \
+               CoreFoundation; do
+        [ -f "$_src/${_h}.h" ] && cp "$_src/${_h}.h" "$_fwroot/Versions/A/Headers/"
+    done
+
+    # Private headers
+    for _h in CFBundlePriv CFCharacterSetPriv CFError_Private CFLogUtilities \
+               CFPriv CFRuntime CFStorage CFStreamAbstract CFStreamPriv \
+               CFStreamInternal CFStringDefaultEncoding CFStringEncodingConverter \
+               CFStringEncodingConverterExt CFUniChar CFUnicodeDecomposition \
+               CFUnicodePrecomposition ForFoundationOnly; do
+        [ -f "$_src/${_h}.h" ] && cp "$_src/${_h}.h" "$_fwroot/Versions/A/PrivateHeaders/"
+    done
+
+    [ -f "$_objbase/CoreFoundation" ] && \
+        cp "$_objbase/CoreFoundation" "$_fwroot/Versions/A/CoreFoundation"
+
+    package_root CF "$_dstroot"
+}
+
+build_launchd() {
+    echo "=== Building: launchd ==="
+    _src="$SRC_APPLE/launchd_258.18/launchd"
+    [ -d "$_src" ] || { echo "  SKIP: source not found at $_src"; return 0; }
+
+    # launchd needs CoreFoundation, mach, IOKit, Security, bsm, dns_sd.
+    # These are available from the Darwin SDK assembled in the Dockerfile.
+    _extra="-I$_src/src -I$DARWIN_SDK/usr/include $EXTRA_CFLAGS"
+
+    build_autoconf "$_src" launchd \
+        --sbindir=/sbin \
+        --bindir=/bin \
+        --sysconfdir=/private/etc \
+        CFLAGS="$_extra" \
+        CXXFLAGS="$_extra"
+}
+
+build_IOKitUser() {
+    echo "=== Building: IOKitUser ==="
+    _src="$SRC_APPLE/IOKitUser"
+    [ -d "$_src" ] || { echo "  SKIP: source not found at $_src"; return 0; }
+
+    _bdir="$BUILD_DIR/IOKitUser"
+    _dstroot="$BUILD_DIR/IOKitUser-DSTROOT"
+    mkdir -p "$_bdir" "$_dstroot/usr/lib" "$_dstroot/usr/include/IOKit"
+
+    # IOKitUser builds IOKit.framework (user-space API to the IOKit kernel).
+    # Key sources: IOKitLib.c, IOCFBundle.c, IOCFPlugIn.c, IOCFSerialize.c,
+    #              IOCFUnserialize.tab.c, IOBundle.c, iokitmig.c, etc.
+    _srcs="IOKitLib.c IOCFBundle.c IOCFPlugIn.c IOCFSerialize.c \
+           IOBundle.c iokitmig.c IOCFURLAccess.c IOSystemConfiguration.c \
+           IODataQueueClient.c"
+
+    _iflags="-I$_src -I$DARWIN_SDK/usr/include $EXTRA_CFLAGS"
+
+    for _f in $_srcs; do
+        [ -f "$_src/$_f" ] || continue
+        $CC -c "$_src/$_f" \
+            $_iflags \
+            -mmacosx-version-min=10.5 -O2 \
+            -o "$_bdir/$(basename "$_f" .c).o" 2>&1 | head -3 || true
+    done
+
+    _objs=$(ls "$_bdir"/*.o 2>/dev/null)
+    if [ -n "$_objs" ]; then
+        $CC -dynamiclib \
+            -install_name /System/Library/Frameworks/IOKit.framework/Versions/A/IOKit \
+            -compatibility_version 1 -current_version 1 \
+            $_objs \
+            -framework CoreFoundation \
+            -o "$_bdir/IOKit" 2>&1 | head -5 || true
+    fi
+
+    # Install headers.
+    mkdir -p "$_dstroot/System/Library/Frameworks/IOKit.framework/Versions/A/Headers"
+    cp "$_src/"*.h "$_dstroot/System/Library/Frameworks/IOKit.framework/Versions/A/Headers/" \
+        2>/dev/null || true
+
+    [ -f "$_bdir/IOKit" ] && \
+        cp "$_bdir/IOKit" \
+           "$_dstroot/System/Library/Frameworks/IOKit.framework/Versions/A/"
+
+    package_root IOKitUser "$_dstroot"
+}
+
+build_IOHIDFamily() {
+    echo "=== Building: IOHIDFamily (kext) ==="
+    _src="$SRC_APPLE/IOHIDFamily"
+    [ -d "$_src" ] || { echo "  SKIP: source not found at $_src"; return 0; }
+
+    _dstroot="$BUILD_DIR/IOHIDFamily-DSTROOT"
+    mkdir -p "$_dstroot"
+
+    # IOHIDFamily is a kernel extension (kext); its .cpp/.c files compile as
+    # KEXT source (linking against the kernel-extension ABI, not user-space).
+    # Kernel extensions cannot be meaningfully cross-compiled without the full
+    # XNU kext SDK (Kernel.framework + KPI headers).  We install the public
+    # headers and user-library portion here; the kext binary itself ships in
+    # the pre-built xnu.root.tar.gz.
+    mkdir -p "$_dstroot/System/Library/Extensions/IOHIDFamily.kext/Contents"
+    if [ -d "$_src/IOHIDFamily" ]; then
+        cp -r "$_src/IOHIDFamily" \
+              "$_dstroot/System/Library/Extensions/IOHIDFamily.kext/Contents/Resources" \
+              2>/dev/null || true
+    fi
+
+    package_root IOHIDFamily "$_dstroot"
+}
+
+build_IOAudioFamily() {
+    echo "=== Building: IOAudioFamily (kext headers) ==="
+    _src="$SRC_APPLE/IOAudioFamily"
+    [ -d "$_src" ] || { echo "  SKIP: source not found at $_src"; return 0; }
+
+    _dstroot="$BUILD_DIR/IOAudioFamily-DSTROOT"
+    mkdir -p "$_dstroot/System/Library/Extensions"
+
+    # Same as IOHIDFamily: install headers; kext binary ships in xnu.root.
+    mkdir -p "$_dstroot/System/Library/Frameworks/CoreAudio.framework/Headers"
+    find "$_src" -name "*.h" -not -path "*/Examples/*" \
+        -exec cp {} "$_dstroot/System/Library/Frameworks/CoreAudio.framework/Headers/" \; \
+        2>/dev/null || true
+
+    package_root IOAudioFamily "$_dstroot"
+}
+
+build_kext_tools() {
+    echo "=== Building: kext_tools ==="
+    _src="$SRC_APPLE/kext_tools"
+    [ -d "$_src" ] || { echo "  SKIP: source not found at $_src"; return 0; }
+
+    _bdir="$BUILD_DIR/kext_tools"
+    _dstroot="$BUILD_DIR/kext_tools-DSTROOT"
+    mkdir -p "$_bdir" "$_dstroot/sbin" "$_dstroot/usr/sbin"
+
+    # kext_tools contains: kextd, kextload, kextunload, kextstat, kextcache.
+    # They all depend on IOKit + CoreFoundation.
+    _iflags="-I$_src -I$DARWIN_SDK/usr/include $EXTRA_CFLAGS"
+    _common="arch.c QEQuery.c"
+
+    for _tool in kextd kextload kextunload kextstat kextcache; do
+        _main="${_tool}.c"
+        [ -f "$_src/$_main" ] || continue
+
+        # Gather the C files that belong to this tool (simplification: compile all
+        # .c files and let the linker discard unused symbols).
+        _srcs=$(cd "$_src" && ls ./*.c 2>/dev/null | tr '\n' ' ')
+        _objs=""
+        for _f in $_srcs; do
+            _o="$_bdir/${_tool}_$(basename "$_f" .c).o"
+            $CC -c "$_src/$_f" \
+                $_iflags \
+                -mmacosx-version-min=10.5 -O2 \
+                -o "$_o" 2>&1 | head -2 || true
+            [ -f "$_o" ] && _objs="$_objs $_o"
+        done
+        $CC $_objs \
+            -framework IOKit \
+            -framework CoreFoundation \
+            -o "$_dstroot/sbin/$_tool" 2>&1 | head -3 || true
+    done
+
+    package_root kext_tools "$_dstroot"
+}
+
+build_configd() {
+    echo "=== Building: configd ==="
+    _src="$SRC_APPLE/configd"
+    [ -d "$_src" ] || { echo "  SKIP: source not found at $_src"; return 0; }
+
+    _bdir="$BUILD_DIR/configd"
+    _dstroot="$BUILD_DIR/configd-DSTROOT"
+    mkdir -p "$_bdir" "$_dstroot/sbin"
+
+    # configd is the System Configuration daemon + framework.
+    # It uses CoreFoundation, SystemConfiguration, and Mach IPC.
+    _iflags="-I$_src -I$_src/configd.tproj \
+             -I$DARWIN_SDK/usr/include $EXTRA_CFLAGS"
+
+    _srcs=$(cd "$_src/configd.tproj" 2>/dev/null && ls ./*.c 2>/dev/null | tr '\n' ' ')
+    _objs=""
+    for _f in $_srcs; do
+        _o="$_bdir/$(basename "$_f" .c).o"
+        $CC -c "$_src/configd.tproj/$_f" \
+            $_iflags \
+            -mmacosx-version-min=10.5 -O2 \
+            -o "$_o" 2>&1 | head -2 || true
+        [ -f "$_o" ] && _objs="$_objs $_o"
+    done
+    $CC $_objs \
+        -framework CoreFoundation \
+        -framework SystemConfiguration \
+        -o "$_dstroot/sbin/configd" 2>&1 | head -3 || true
+
+    package_root configd "$_dstroot"
+}
+
+build_mDNSResponder() {
+    echo "=== Building: mDNSResponder ==="
+    _src="$SRC_APPLE/mDNSResponder"
+    [ -d "$_src" ] || { echo "  SKIP: source not found at $_src"; return 0; }
+
+    _bdir="$BUILD_DIR/mDNSResponder"
+    _dstroot="$BUILD_DIR/mDNSResponder-DSTROOT"
+    mkdir -p "$_bdir" "$_dstroot/usr/sbin" "$_dstroot/usr/lib"
+
+    # mDNSResponder ships mDNSPosix (Linux-native) and mDNSMacOSX (Darwin).
+    # For the Darwin target image we want mDNSMacOSX.
+    _posix="$_src/mDNSPosix"
+    _shared="$_src/mDNSCore"
+
+    # Compile the shared mDNSCore sources.
+    _iflags="-I$_src/mDNSCore -I$_src/mDNSShared \
+             -I$DARWIN_SDK/usr/include $EXTRA_CFLAGS"
+    _srcs="$_shared/mDNS.c \
+           $_shared/DNSDigest.c \
+           $_shared/uDNS.c \
+           $_src/mDNSShared/dnssd_clientshim.c \
+           $_src/mDNSShared/mDNSDebug.c"
+
+    _objs=""
+    for _f in $_srcs; do
+        [ -f "$_f" ] || continue
+        _o="$_bdir/$(basename "$_f" .c).o"
+        $CC -c "$_f" $_iflags -mmacosx-version-min=10.5 -O2 \
+            -o "$_o" 2>&1 | head -2 || true
+        [ -f "$_o" ] && _objs="$_objs $_o"
+    done
+
+    $CC $_objs \
+        -framework CoreFoundation \
+        -o "$_dstroot/usr/sbin/mDNSResponder" 2>&1 | head -3 || true
+
+    package_root mDNSResponder "$_dstroot"
+}
+
+build_bless() {
+    echo "=== Building: bless ==="
+    _src="$SRC_APPLE/bless"
+    [ -d "$_src" ] || { echo "  SKIP: source not found at $_src"; return 0; }
+
+    _bdir="$BUILD_DIR/bless"
+    _dstroot="$BUILD_DIR/bless-DSTROOT"
+    mkdir -p "$_bdir" "$_dstroot/usr/sbin"
+
+    _iflags="-I$_src -I$DARWIN_SDK/usr/include $EXTRA_CFLAGS"
+    _srcs=$(cd "$_src" && ls ./*.c 2>/dev/null | tr '\n' ' ')
+
+    _objs=""
+    for _f in $_srcs; do
+        [ -f "$_src/$_f" ] || continue
+        _o="$_bdir/$(basename "$_f" .c).o"
+        $CC -c "$_src/$_f" $_iflags -mmacosx-version-min=10.5 -O2 \
+            -o "$_o" 2>&1 | head -2 || true
+        [ -f "$_o" ] && _objs="$_objs $_o"
+    done
+    $CC $_objs \
+        -framework CoreFoundation \
+        -framework DiskArbitration \
+        -o "$_dstroot/usr/sbin/bless" 2>&1 | head -3 || true
+
+    package_root bless "$_dstroot"
+}
+
+build_at_cmds() {
+    echo "=== Building: at_cmds ==="
+    _src="$SRC_APPLE/at_cmds"
+    [ -d "$_src" ] || { echo "  SKIP: source not found at $_src"; return 0; }
+
+    # at_cmds uses AppleTalk network headers (netat/).
+    # Compile the individual tools (atprint, atlookup, etc.).
+    _dstroot="$BUILD_DIR/at_cmds-DSTROOT"
+    mkdir -p "$_dstroot/usr/bin"
+
+    _iflags="-I$DARWIN_SDK/usr/include $EXTRA_CFLAGS"
+
+    for _tdir in "$_src/"*.tproj; do
+        [ -d "$_tdir" ] || continue
+        _tname=$(basename "$_tdir" .tproj)
+        _srcs=$(cd "$_tdir" && ls ./*.c 2>/dev/null | tr '\n' ' ')
+        [ -z "$_srcs" ] && continue
+
+        _bdir="$BUILD_DIR/at_cmds_${_tname}"
+        mkdir -p "$_bdir"
+        _objs=""
+        for _f in $_srcs; do
+            _o="$_bdir/$(basename "$_f" .c).o"
+            $CC -c "$_tdir/$_f" $_iflags -mmacosx-version-min=10.5 -O2 \
+                -o "$_o" 2>&1 | head -2 || true
+            [ -f "$_o" ] && _objs="$_objs $_o"
+        done
+        $CC $_objs -o "$_dstroot/usr/bin/$_tname" 2>&1 | head -2 || true
+    done
+
+    package_root at_cmds "$_dstroot"
+}
+
+build_ipv6configuration() {
+    echo "=== Building: ipv6configuration ==="
+    _src="$SRC_APPLE/ipv6configuration"
+    [ -d "$_src" ] || { echo "  SKIP: source not found at $_src"; return 0; }
+
+    _dstroot="$BUILD_DIR/ipv6configuration-DSTROOT"
+    mkdir -p "$_dstroot/usr/sbin"
+
+    _iflags="-I$DARWIN_SDK/usr/include $EXTRA_CFLAGS"
+    _srcs=$(cd "$_src" && ls ./*.c ./*.m 2>/dev/null | tr '\n' ' ')
+    _bdir="$BUILD_DIR/ipv6configuration"
+    mkdir -p "$_bdir"
+
+    _objs=""
+    for _f in $_srcs; do
+        _o="$_bdir/$(basename "${_f%.*}").o"
+        $CC -c "$_src/$_f" $_iflags -mmacosx-version-min=10.5 -O2 \
+            -o "$_o" 2>&1 | head -2 || true
+        [ -f "$_o" ] && _objs="$_objs $_o"
+    done
+    $CC $_objs \
+        -framework CoreFoundation \
+        -framework SystemConfiguration \
+        -o "$_dstroot/usr/sbin/ipv6configuration" 2>&1 | head -3 || true
+
+    package_root ipv6configuration "$_dstroot"
+}
+
+build_Tokend() {
+    echo "=== Building: Tokend ==="
+    _src="$SRC_APPLE/Tokend"
+    [ -d "$_src" ] || { echo "  SKIP: source not found at $_src"; return 0; }
+
+    _dstroot="$BUILD_DIR/Tokend-DSTROOT"
+    mkdir -p "$_dstroot/System/Library/Security"
+
+    _iflags="-I$_src -I$DARWIN_SDK/usr/include $EXTRA_CFLAGS"
+    _bdir="$BUILD_DIR/Tokend"
+    mkdir -p "$_bdir"
+
+    _srcs=$(find "$_src" -name "*.cpp" -o -name "*.c" | head -20)
+    _objs=""
+    for _f in $_srcs; do
+        _o="$_bdir/$(echo "$_f" | tr '/' '_').o"
+        $CXX -c "$_f" $_iflags -mmacosx-version-min=10.5 -O2 \
+            -o "$_o" 2>&1 | head -2 || true
+        [ -f "$_o" ] && _objs="$_objs $_o"
+    done
+    $CXX $_objs \
+        -framework CoreFoundation \
+        -framework Security \
+        -o "$_dstroot/System/Library/Security/tokend" 2>&1 | head -3 || true
+
+    package_root Tokend "$_dstroot"
+}
+
+build_libsecurity_apple_csp() {
+    echo "=== Building: libsecurity_apple_csp ==="
+    _src="$SRC_APPLE/libsecurity_apple_csp"
+    [ -d "$_src" ] || { echo "  SKIP: source not found at $_src"; return 0; }
+
+    _dstroot="$BUILD_DIR/libsecurity_apple_csp-DSTROOT"
+    mkdir -p "$_dstroot/usr/lib"
+
+    _bdir="$BUILD_DIR/libsecurity_apple_csp"
+    mkdir -p "$_bdir"
+
+    _iflags="-I$_src -I$DARWIN_SDK/usr/include $EXTRA_CFLAGS"
+    _srcs=$(find "$_src" -name "*.cpp" | head -30)
+    _objs=""
+    for _f in $_srcs; do
+        _o="$_bdir/$(echo "$_f" | tr '/' '_').o"
+        $CXX -c "$_f" $_iflags -mmacosx-version-min=10.5 -O2 \
+            -o "$_o" 2>&1 | head -2 || true
+        [ -f "$_o" ] && _objs="$_objs $_o"
+    done
+    $CXX -dynamiclib $_objs \
+        -framework Security \
+        -framework CoreFoundation \
+        -o "$_dstroot/usr/lib/libsecurity_apple_csp.dylib" 2>&1 | head -3 || true
+
+    package_root libsecurity_apple_csp "$_dstroot"
+}
+
+build_libsecurity_filevault() {
+    echo "=== Building: libsecurity_filevault ==="
+    _src="$SRC_APPLE/libsecurity_filevault"
+    [ -d "$_src" ] || { echo "  SKIP: source not found at $_src"; return 0; }
+
+    _dstroot="$BUILD_DIR/libsecurity_filevault-DSTROOT"
+    mkdir -p "$_dstroot/usr/lib"
+
+    _bdir="$BUILD_DIR/libsecurity_filevault"
+    mkdir -p "$_bdir"
+
+    _iflags="-I$_src -I$DARWIN_SDK/usr/include $EXTRA_CFLAGS"
+    _srcs=$(find "$_src" -name "*.cpp" -o -name "*.c" | head -20)
+    _objs=""
+    for _f in $_srcs; do
+        _o="$_bdir/$(echo "$_f" | tr '/' '_').o"
+        $CXX -c "$_f" $_iflags -mmacosx-version-min=10.5 -O2 \
+            -o "$_o" 2>&1 | head -2 || true
+        [ -f "$_o" ] && _objs="$_objs $_o"
+    done
+    $CXX -dynamiclib $_objs \
+        -framework Security \
+        -framework CoreFoundation \
+        -o "$_dstroot/usr/lib/libsecurity_filevault.dylib" 2>&1 | head -3 || true
+
+    package_root libsecurity_filevault "$_dstroot"
+}
+
+build_dtrace() {
+    echo "=== Building: dtrace ==="
+    _src="$SRC_APPLE/dtrace"
+    [ -d "$_src" ] || { echo "  SKIP: source not found at $_src"; return 0; }
+
+    _dstroot="$BUILD_DIR/dtrace-DSTROOT"
+    mkdir -p "$_dstroot/usr/sbin" "$_dstroot/usr/lib"
+
+    _bdir="$BUILD_DIR/dtrace"
+    mkdir -p "$_bdir"
+
+    _iflags="-I$_src -I$_src/lib -I$DARWIN_SDK/usr/include $EXTRA_CFLAGS"
+
+    # dtrace main binary (user-space controller)
+    _srcs=$(find "$_src/lib" -name "*.c" 2>/dev/null | head -20)
+    _objs=""
+    for _f in $_srcs; do
+        _o="$_bdir/$(echo "$_f" | tr '/' '_').o"
+        $CC -c "$_f" $_iflags -mmacosx-version-min=10.5 -O2 \
+            -o "$_o" 2>&1 | head -2 || true
+        [ -f "$_o" ] && _objs="$_objs $_o"
+    done
+    $CC $_objs \
+        -framework CoreFoundation \
+        -o "$_dstroot/usr/sbin/dtrace" 2>&1 | head -3 || true
+
+    package_root dtrace "$_dstroot"
+}
+
+################################################################################
+# MASTER BUILD LIST AND DISPATCH
+################################################################################
+
+# Dependency-ordered list of all projects with patched source in this repo.
+ALL_PROJECTS="
+    libelf
+    libdwarf
+    gnutar
+    iodbc
+    CF
+    IOKitUser
+    IOHIDFamily
+    IOAudioFamily
+    kext_tools
+    configd
+    mDNSResponder
+    bless
+    at_cmds
+    ipv6configuration
+    Tokend
+    libsecurity_apple_csp
+    libsecurity_filevault
+    dtrace
+    launchd
+"
+
+# If specific projects were named on the command line, build only those.
+if [ $# -gt 0 ]; then
+    BUILD_LIST="$*"
+else
+    BUILD_LIST="$ALL_PROJECTS"
+fi
+
+echo "==> Projects to build: $(echo "$BUILD_LIST" | tr '\n' ' ')"
+echo ""
+
+FAILED=""
+for _proj in $BUILD_LIST; do
+    "build_${_proj}" 2>&1 || FAILED="$FAILED $_proj"
+done
+
+rm -rf "$BUILD_DIR"
+
+echo ""
+if [ -n "$FAILED" ]; then
+    echo "==> pd_build_linux finished with errors in:$FAILED"
+    echo "    (Partial failures are expected without a complete Darwin SDK.)"
+    echo "    Successfully built roots are in puredarwin.roots/Roots/9J61pd1/"
+    exit 1
+else
+    echo "==> pd_build_linux complete."
+    echo "    Roots written to: puredarwin.roots/Roots/9J61pd1/"
+    echo ""
+    echo "    Next step — assemble the disk image:"
+    echo "      sudo ./setup/pd_setup_linux puredarwin.vmwarevm PureDarwin"
+fi

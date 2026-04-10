@@ -11,12 +11,8 @@ The project is named after [Hexley](https://en.wikipedia.org/wiki/Hexley), the D
 1. [Background](#1-background)
 2. [Repository Structure](#2-repository-structure)
 3. [Build Pipeline Overview](#3-build-pipeline-overview)
-4. [Requirements](#4-requirements)
-5. [Step-by-Step Build Guide](#5-step-by-step-build-guide)
-   - [Step 1 — Clone this repo](#step-1--clone-this-repo)
-   - [Step 2 — Compile (macOS)](#step-2--compile-macos-only)
-   - [Step 3 — Assemble the image (macOS)](#step-3--assemble-the-image-macos-only)
-   - [Shortcut — Use the pre-built filesystem](#shortcut--use-the-pre-built-filesystem)
+4. [Build Guide — macOS (primary)](#4-build-guide--macos-primary)
+5. [Build Guide — Windows / Linux (experimental)](#5-build-guide--windows--linux-experimental)
 6. [Offline Build](#6-offline-build)
 7. [Source Changes Reference](#7-source-changes-reference)
 8. [Binary Roots Reference](#8-binary-roots-reference)
@@ -34,7 +30,7 @@ The project is named after [Hexley](https://en.wikipedia.org/wiki/Hexley), the D
 
 **PureDarwin Xmas** was a Christmas 2008 release that demonstrated a working i386 VMware virtual machine running Darwin 9 (corresponding to Mac OS X 10.5.6) with a basic userland, XNU kernel, Chameleon bootloader, X11 window system, and simple desktop (Fluxbox + xterm). It remains the last publicly distributed bootable PureDarwin release.
 
-The original build pipeline broke completely circa 2016 when `macosforge.org` was shut down, taking all source and binary download links with it. hexley9k replaces those dead links with fetches from Apple's official open-source GitHub mirror (`apple-oss-distributions`) and carries the pre-built binary roots for everything that cannot be compiled from available sources.
+The original build pipeline broke completely circa 2016 when `macosforge.org` was shut down, taking all source and binary download links with it. hexley9k replaces those dead links: the patched Darwin source trees are committed directly in `source/`, pre-built binary roots for every unmodified package are committed in `puredarwin.roots/Roots/`, and the Darwin SDK headers needed for cross-compilation are assembled from those same pre-built roots — so the entire build works from a single `git clone` with no external downloads.
 
 ---
 
@@ -110,22 +106,27 @@ hexley9k/
 │
 ├── setup/                           ← Build pipeline scripts (run on macOS host)
 │   ├── pd_config                    ← Global variables (ARCH=i386, DARWIN_RELEASE=9)
-│   ├── pd_build_source              ← Step 2: compile with DarwinBuild → .root.tar.gz
-│   ├── pd_setup                     ← Step 3: assemble bootable HFS+ / VMware image
-│   ├── pd_setup_prebuilt            ← Step 3 shortcut: package pre-extracted filesystem
+│   ├── pd_build_source              ← Compile with DarwinBuild (macOS); delegates to pd_build_linux on Linux
+│   ├── pd_build_linux               ← Cross-compile with clang + cctools-port (Linux/WSL) ⚠ experimental
+│   ├── pd_setup                     ← Assemble bootable HFS+ / VMware image (macOS)
+│   ├── pd_setup_linux               ← Assemble bootable image (Linux/WSL) ⚠ experimental
+│   ├── pd_setup_prebuilt            ← Shortcut: package a pre-extracted filesystem (macOS)
 │   ├── pd_roots                     ← Package list — full release (~160 packages)
 │   ├── pd_roots.bootstrap           ← Package list — bootstrap release (~60 packages)
 │   ├── pd_roots.nano                ← Package list — minimal nano release
 │   ├── pd_roots.extra               ← Extra PureDarwin-specific packages
-│   ├── README.txt                   ← Legacy setup notes
+│   ├── README.txt                   ← Setup notes and pipeline documentation
 │   └── pd_setup_files/
 │       ├── boot/i386/               ← Chameleon bootloader binaries (boot0, boot1h, boot, cdboot)
-│       ├── mkisofs                  ← El Torito ISO builder (macOS binary)
-│       ├── qemu-img                 ← VMDK converter (macOS binary)
+│       ├── mkisofs                  ← El Torito ISO builder (macOS binary, used by pd_setup)
+│       ├── qemu-img                 ← VMDK converter (macOS binary, used by pd_setup)
 │       ├── startupfiletool          ← Sets HFS+ startup file
 │       ├── iofindwholemedia         ← Locates whole-disk device node
 │       ├── VMware-Drivers-OpenSource.zip  ← NullCPUPowerManagement + LegacyPIIXATA KEXTs
 │       └── VMwareIOFramebuffer.kext.zip   ← VMware display driver
+│
+├── Dockerfile                       ← Multi-stage Docker build (cctools-port + Darwin SDK + compiler)
+├── docker-build.sh                  ← One-command wrapper: build + assemble (Windows/Linux) ⚠ experimental
 │
 ├── extracted/
 │   └── filesystem/
@@ -139,8 +140,8 @@ hexley9k/
 │           ├── private/             ← etc → /etc, var → /var, tmp → /tmp symlinks
 │           └── ...
 │
-└── source/                          ← Pre-patched Apple Darwin source (committed)
-    ├── apple/                       ← Fetched from apple-oss-distributions at tagged versions, patches applied
+└── source/                          ← Pre-patched Apple Darwin source (committed, all patches applied)
+    ├── apple/                       ← Darwin projects at exact tagged versions with patches applied in-tree
     │   ├── at_cmds/                 ← at_cmds-54
     │   ├── bless/                   ← bless-63.2
     │   ├── CF/                      ← CF-476.15
@@ -170,92 +171,75 @@ hexley9k/
 
 ## 3. Build Pipeline Overview
 
+The build has two phases — **compile** (produces `.root.tar.gz` archives from source) and **assemble** (packs those archives into a bootable disk image).  Compilation requires a Darwin-compatible toolchain; assembly only requires standard disk-image utilities.
+
 ```
- [any OS]                   [macOS only]
-    │                           │
-  git clone hexley9k            │
-  (source/ included,            │
-   patches pre-applied)         │
-    │                           │
-    └──────────────────────────>│
-                           pd_build_source
-                           (DarwinBuild + Xcode 3.x)
-                           → Roots/9J61pd1/*.root.tar.gz
-                                │
-                           pd_setup or pd_setup_prebuilt
-                           (dd + pdisk + newfs_hfs + tar + bless + qemu-img)
-                                │
-                           puredarwin.vmwarevm/
-                           (bootable VMware VM)
+ git clone hexley9k
+ (source/ included with all patches pre-applied — no separate fetch/patch step)
+     │
+     ├─── macOS path ──────────────────────────────────────────────────────────
+     │    pd_build_source          (DarwinBuild + Xcode 3.x / GCC 4.2)
+     │    → Roots/9J61pd1/*.root.tar.gz
+     │    pd_setup                 (dd + pdisk + newfs_hfs + bless + qemu-img)
+     │    → puredarwin.vmwarevm
+     │
+     └─── Windows / Linux path  ⚠ EXPERIMENTAL ────────────────────────────────
+          docker-build.sh  OR  pd_build_linux
+          (clang cross-compiling to i386-apple-darwin9 via cctools-port)
+          → Roots/9J61pd1/*.root.tar.gz
+          pd_setup_linux           (losetup + parted + mkfs.hfsplus + qemu-img)
+          → puredarwin.vmwarevm
 ```
 
-Cloning the repo gives you the pre-patched source directly. Compilation and image assembly require a macOS host with specific tooling (see [Requirements](#4-requirements)).
+The pre-built binary roots in `puredarwin.roots/Roots/` cover the majority of packages; only the ~19 patched projects in `source/` need compiling.  The SDK headers used for cross-compilation are assembled from `puredarwin.roots/Roots/pd/xnu.root.tar.gz` and `puredarwin.roots/Roots/9F33pd1/objc4.root.tar.gz` — both committed in this repo.  **No external downloads are required after cloning.**
 
 ---
 
-## 4. Requirements
+## 4. Build Guide — macOS (primary)
 
-### Host OS
-- **macOS 10.5 Leopard or 10.6 Snow Leopard** is the recommended build host. Both versions ship the toolchain that Darwin 9 was built with.
-- Later macOS versions (10.7+) can be used but require carefully selecting the 10.5 SDK and may need additional compatibility shims. This is not tested.
+This is the **recommended and fully tested** path.  It uses the same toolchain Darwin 9 was originally built with.
 
-### Toolchain
+### Prerequisites
+
 | Tool | Version | Notes |
 |------|---------|-------|
-| Xcode | 3.x (3.1.4 last for 10.5) | Provides GCC 4.2, 10.5 SDK, project makefiles |
-| DarwinBuild | current git main | Build driver that sets up chroot + installs headers/roots |
+| macOS | 10.5 Leopard or 10.6 Snow Leopard | Recommended; later versions require the 10.5 SDK |
+| Xcode | 3.x (3.1.4 is last for Leopard) | Provides GCC 4.2, MacOSX10.5.sdk, pb_makefiles |
+| DarwinBuild | current git main | Build driver that manages chroot + dependencies |
 | git | any | For cloning this repo |
 
-**Installing DarwinBuild:**
-```sh
-git clone https://github.com/apple-oss-distributions/darwinbuild
-cd darwinbuild
-sudo make install
-# installs to /usr/local/bin/darwinbuild
-```
+**Disk space:** ~1.6 GB repo + ~5–10 GB DarwinBuild root + ~800 MB output.
 
 Xcode 3.x is available at [developer.apple.com/download/more](https://developer.apple.com/download/more/) (free Apple Developer account required).
 
-### Disk Space
-| Component | Approximate Size |
-|-----------|----------------|
-| This repo (with `source/`) | ~1.6 GB (binary roots + pre-patched source) |
-| DarwinBuild build root | ~5–10 GB |
-| Final `.vmwarevm` output | ~800 MB |
+**Install DarwinBuild:**
+```sh
+git clone https://github.com/apple-oss-distributions/darwinbuild
+cd darwinbuild
+sudo make install   # installs to /usr/local/bin/darwinbuild
+```
 
----
-
-## 5. Step-by-Step Build Guide
-
-### Step 1 — Clone this repo
+### Step 1 — Clone the repo
 
 ```sh
-git clone https://github.com/your-org/hexley9k.git
-git lfs pull   # download binary roots via Git LFS
+git clone https://github.com/pikalover6/hexley9k.git
 cd hexley9k
 ```
 
-The repo includes `source/` with all Apple Darwin source already fetched and patched. No separate fetch or patch step is needed. No internet access is required after cloning; see [Section 6](#6-offline-build).
+`source/` is committed with all patches pre-applied.  No separate fetch or patch step is needed, and no internet access is required after cloning.
 
----
-
-### Step 2 — Compile (macOS only)
+### Step 2 — Compile
 
 ```sh
 sudo ./setup/pd_build_source
 ```
 
-Or to (re)build a single project:
+To rebuild a single project:
 ```sh
 sudo ./setup/pd_build_source kext_tools
 ```
 
-This script:
-1. Checks that `darwinbuild` is installed and that `source/` exists (it is committed in the repo)
-2. Initialises a DarwinBuild build root at `/var/tmp/darwinbuild_pd/` using `plists/9J61pd1.plist` as the project descriptor
-3. Symlinks each patched source tree into DarwinBuild's `SourceCache/` so it skips its own download step
-4. Calls `darwinbuild <project>` for each project in dependency order
-5. Copies the resulting `.root.tar.gz` from DarwinBuild's `Roots/` into `puredarwin.roots/Roots/9J61pd1/`
+`pd_build_source` stages the pre-patched source into DarwinBuild's `SourceCache/` (skipping its own download step), then calls `darwinbuild <project>` for each project in dependency order, writing the results to `puredarwin.roots/Roots/9J61pd1/`.
 
 **Build order** (dependency-safe):
 ```
@@ -265,75 +249,150 @@ libelf → libdwarf → dtrace → IOKitUser → IOHIDFamily → IOAudioFamily
 → libsecurity_filevault → mDNSResponder → Tokend → CF
 ```
 
-The compiled roots supplement (not replace) the pre-built roots already in `puredarwin.roots/Roots/`. Projects without patches — the majority — are picked up directly from their pre-built archives.
+**Requires:** macOS, root, `darwinbuild`, Xcode 3.x with MacOSX10.5.sdk  
+**Output:** `puredarwin.roots/Roots/9J61pd1/<project>.root.tar.gz`
 
-**Requires:** macOS, root, `darwinbuild`, Xcode 3.x with 10.5 SDK
-**Output:** `puredarwin.roots/Roots/9J61pd1/<project>.root.tar.gz` for each compiled project
-
----
-
-### Step 3 — Assemble the image (macOS only)
+### Step 3 — Assemble the image
 
 ```sh
 cd setup
 sudo ./pd_setup puredarwin.vmwarevm PureDarwin
 ```
 
-`pd_setup` takes two arguments: an output path and a volume name. The extension of the output path determines the output format:
+`pd_setup` creates a zeroed raw image, partitions it as Apple Partition Map, formats HFS+J, deploys the binary roots, blesses the volume, creates a `toor` user, rebuilds the kext cache, and converts to VMDK.
 
 | Output path | Format |
 |-------------|--------|
 | `foo.vmwarevm` | VMware virtual machine bundle (`.vmx` + `.vmdk`) |
 | `foo.vmdk` | Raw VMDK only |
-| `foo.iso` | Bootable ISO 9660 with El Torito |
+| `foo.iso` | Bootable ISO with El Torito |
 | `/Volumes/PureDarwin` | Install to a mounted volume |
-| `/dev/diskX` | Install to a physical disk |
-
-**What `pd_setup` does internally:**
-1. Creates a zeroed raw disk image with `dd`
-2. Partitions it as Apple Partition Map (APM) with `pdisk`
-3. Injects an El Torito no-emulation boot record with `mkisofs`
-4. Formats the HFS+ partition with `newfs_hfs -J` (journaled HFS+)
-5. Mounts it with `hdid` / `hdiutil`
-6. Deploys binary roots by `tar xjpf` from `pd_roots` and `pd_roots.extra` lists
-7. Copies `projects/PureDarwinSettings/` config files into place
-8. Blesses the volume with `bless --folder CoreServices --bootinfo --bootefi`
-9. Sets hostname, timezone (`Europe/Paris` from original Xmas), motd, and dyld paths
-10. Creates a `toor` superuser account via `pd_injectuser` in a `chroot`
-11. Builds `Extensions.mkext` with `kextcache -a i386 -m`
-12. Converts the raw image to VMDK with `qemu-img convert -O vmdk`
-13. Generates a `.vmx` configuration with `guestOS = "darwin"`, 512 MB RAM, PIIX ATA, vmxnet NIC
 
 **Requires:** macOS root, `hdid`, `pdisk`, `newfs_hfs`, `hdiutil`, `vsdbutil`, `kextcache`, `bless`, `ditto`, `chroot`
 
----
-
 ### Shortcut — Use the pre-built filesystem
 
-If you want to skip compilation entirely and just repackage the reference PureDarwin Xmas filesystem (with any local edits you've made):
+Skip compilation and repackage the reference PureDarwin Xmas filesystem directly:
 
 ```sh
 cd setup
 sudo ./pd_setup_prebuilt ../extracted/filesystem/PureDarwinXmas puredarwin.vmwarevm PureDarwin
 ```
 
-`pd_setup_prebuilt` sets the `PREBUILT_FILESYSTEM` environment variable and calls `pd_setup`, which then uses `ditto` to copy the pre-assembled filesystem tree instead of unpacking roots. This is the fastest path to a runnable image and requires no compilation.
+Edit files under `extracted/filesystem/PureDarwinXmas/` before running if you want to customise the image.
 
-> Edit files under `extracted/filesystem/PureDarwinXmas/` first if you want to customise the image before packaging.
+---
+
+## 5. Build Guide — Windows / Linux (experimental)
+
+> ⚠️ **Experimental.**  The Windows/Linux pipeline cross-compiles Darwin projects on Linux using `clang` targeting `i386-apple-darwin9` plus [`cctools-port`](https://github.com/tpoechtrager/cctools-port) for the Mach-O linker.  The Darwin SDK headers are assembled entirely from pre-built roots already in this repo — no Apple repositories are cloned.
+>
+> Cross-compilation of Objective-C heavy projects (CF, configd, IOKitUser) is incomplete without a full Darwin `libSystem` stub.  Expect some projects to produce empty or placeholder roots.  The assembled image will boot with the pre-built roots; the cross-compiled roots are supplementary.
+
+### Option A — Docker (recommended for Windows / any Linux)
+
+**Prerequisites:** Docker Desktop ≥ 20.10 (Windows/Mac) or Docker Engine ≥ 20.10 (Linux).
+
+```sh
+# Clone the repo
+git clone https://github.com/pikalover6/hexley9k.git
+cd hexley9k
+
+# Full pipeline: compile + assemble (first run builds the Docker image ~10–30 min)
+./docker-build.sh
+
+# Or: compile only
+./docker-build.sh --build-only
+
+# Or: assemble only (if you already have roots from a prior build)
+./docker-build.sh --assemble-only
+
+# Rebuild specific projects
+./docker-build.sh libelf launchd
+```
+
+**On Windows** (from PowerShell or Git Bash with Docker Desktop running):
+```powershell
+git clone https://github.com/pikalover6/hexley9k.git
+cd hexley9k
+./docker-build.sh
+```
+
+**Output:** `puredarwin.vmwarevm` in the repo root.
+
+The Docker image is self-contained: it builds `cctools-port` from source and assembles the Darwin 9 SDK headers from `puredarwin.roots/Roots/pd/xnu.root.tar.gz` (mach/, sys/, libkern/ headers) and `puredarwin.roots/Roots/9F33pd1/objc4.root.tar.gz` (objc/ headers).  No network access beyond the initial Docker image pull and `cctools-port` clone is required.
+
+**WSL2 note:** WSL1 does not support loop devices.  Ensure you are using WSL2:
+```
+# In %USERPROFILE%\.wslconfig:
+[wsl2]
+kernelCommandLine = vsyscall=emulate
+```
+Then load the loop module before running `pd_setup_linux`:
+```sh
+sudo modprobe loop
+```
+
+### Option B — Bare Linux / WSL2 (manual toolchain setup)
+
+```sh
+# 1. Install system packages
+sudo apt-get install clang llvm lld make autoconf automake \
+     parted kpartx hfsprogs genisoimage qemu-utils rsync openssl xxd
+
+# 2. Build cctools-port
+git clone https://github.com/tpoechtrager/cctools-port /opt/cctools-src
+cd /opt/cctools-src/cctools
+./configure --target=i386-apple-darwin9 --prefix=/opt/cctools \
+            --with-llvm-config=/usr/bin/llvm-config
+make -j$(nproc) && sudo make install
+export PATH=/opt/cctools/bin:$PATH
+
+# 3. Assemble the Darwin 9 SDK from in-repo roots (no Apple cloning needed)
+export DARWIN_SDK=/opt/darwin9-sdk
+mkdir -p "$DARWIN_SDK"
+# XNU kernel headers (mach/, sys/, libkern/, i386/, bsm/, …) + IOKit framework tree
+tar xzf puredarwin.roots/Roots/pd/xnu.root.tar.gz -C "$DARWIN_SDK" \
+    --wildcards './usr/include/*' './System/Library/Frameworks/IOKit.framework/*'
+# Copy IOKit headers into usr/include/IOKit for -I$DARWIN_SDK/usr/include lookups
+mkdir -p "$DARWIN_SDK/usr/include/IOKit"
+cp -r "$DARWIN_SDK/System/Library/Frameworks/IOKit.framework/Versions/A/Headers/." \
+    "$DARWIN_SDK/usr/include/IOKit/"
+# Objective-C runtime headers
+tar xzf puredarwin.roots/Roots/9F33pd1/objc4.root.tar.gz -C "$DARWIN_SDK" \
+    --wildcards './usr/include/objc/*'
+
+# 4. Compile all Darwin projects
+./setup/pd_build_linux
+
+# 5. Assemble the disk image (requires root)
+sudo ./setup/pd_setup_linux puredarwin.vmwarevm PureDarwin
+```
+
+Set `PD_BUILD_VERBOSE=1` to see full compiler output during `pd_build_linux`.
+
+**Output formats supported by `pd_setup_linux`:**
+```sh
+sudo ./setup/pd_setup_linux puredarwin.vmwarevm PureDarwin   # VMware bundle
+sudo ./setup/pd_setup_linux puredarwin.vmdk      PureDarwin  # VMDK only
+sudo ./setup/pd_setup_linux puredarwin.iso       PureDarwin  # bootable ISO
+```
 
 ---
 
 ## 6. Offline Build
 
-After an initial `git clone` + `git lfs pull`, no internet access is needed for any step. Specifically:
+After the initial `git clone`, **no internet access is required** for any build step on any platform.
 
-| What needs network | When |
-|--------------------|------|
-| `git clone hexley9k` + `git lfs pull` | once |
-| Installing DarwinBuild | once, on macOS |
-| Installing Xcode 3.x | once, on macOS |
+| Step | Network needed? | Notes |
+|------|----------------|-------|
+| `git clone hexley9k` | Yes (once) | All source, patches, and binary roots are included |
+| Installing Xcode 3.x | Yes (once, macOS only) | From developer.apple.com |
+| Installing DarwinBuild | Yes (once, macOS only) | From github.com/apple-oss-distributions/darwinbuild |
+| Building the Docker image | Yes (once) | Pulls `ubuntu:22.04`, installs apt packages, clones `cctools-port` |
+| All compile + assemble steps | **No** | Entirely from local files |
 
-Everything else — compiling, assembling — works entirely from local files. `source/` is committed with patches applied. The `puredarwin.roots/Mirror/` directory contains bundled upstream source archives so `libdwarf` and `libelf` build dependencies are also offline.
+`source/` is committed with all patches applied.  The Darwin 9 SDK headers are assembled from `puredarwin.roots/Roots/pd/xnu.root.tar.gz` and `puredarwin.roots/Roots/9F33pd1/objc4.root.tar.gz` — both committed in this repo; no Apple repositories are cloned.  The `puredarwin.roots/Mirror/` directory bundles upstream source archives for `libdwarf`, `libelf`, and other build dependencies.
 
 ---
 
@@ -574,8 +633,11 @@ Two versions of `launchd` are carried:
 
 ## 11. Known Limitations and Issues
 
-### Build host
-The build pipeline has only been tested on macOS Leopard/Snow Leopard with Xcode 3.x. Building on later macOS requires the MacOSX10.5.sdk which must be manually installed; Apple does not ship it with Xcode 4+.
+### macOS build host
+The macOS path (DarwinBuild + Xcode 3.x) has only been tested on macOS Leopard/Snow Leopard.  Building on later macOS requires manually installing the MacOSX10.5.sdk; Apple does not ship it with Xcode 4+.
+
+### Windows / Linux cross-compilation (experimental)
+The `pd_build_linux` / `docker-build.sh` path cross-compiles Darwin projects using `clang -target i386-apple-darwin9` and `cctools-port`.  Projects that are Objective-C-heavy (CF, configd, IOKitUser) require a full `libSystem.B.dylib` stub that is not yet included; those projects produce placeholder roots.  The assembled image boots via the pre-built roots; cross-compiled roots are supplementary.
 
 ### boot-132 source is unavailable
 The DFE `boot-132` bootloader source was hosted exclusively on `puredarwin.googlecode.com`, which has been defunct since 2016. The three `boot-132_dfe_*.p0.patch` files are kept for historical reference but cannot be applied. The pre-built `boot.root.tar.gz` in `Roots/9F33pd1/` is used instead.
@@ -590,7 +652,7 @@ The following projects are listed in `plists/9J61pd1.plist` as having patches, b
 - `libsecurity_ldap_dl-30174` — `libsecurity_ldap_dl-30174.p1.patch.0`
 - `security_dotmac_tp-33607` — `security_dotmac_tp-33607.p1.patch.{0,1,2}`
 
-Pre-built binary roots for all of these are available in `puredarwin.roots/Roots/`. If you need to recompile any of them, the patches would need to be reconstructed from the compiled binaries.
+Pre-built binary roots for all of these are available in `puredarwin.roots/Roots/`.
 
 ### No network stack in early boot
 The PureDarwin Xmas configuration uses `configd` + `mDNSResponder` for network, but DHCP is not always reliable in VMware without the correct VirtioNet or vmxnet driver. The generated `.vmx` uses `vmxnet` (VMware Para-Virtual NIC), which is supported by the `NotApple80211` stub and the included vmxnet KEXT.
@@ -616,7 +678,7 @@ hexley9k currently prioritises build reproducibility. Planned future work, rough
 
 6. **AArch64 / Apple Silicon** — Extremely speculative, but Darwin 22+ (macOS Ventura) XNU source is available for arm64. A future hexley9k could target Darwin 22 on arm64 with a completely different toolchain.
 
-7. **CI / automation** — A GitHub Actions workflow that runs steps 1–2 (fetch + patch) on Linux for quick validation of patch applicability, and optionally drives a macOS runner for full builds.
+7. **CI / automation** — A GitHub Actions workflow using a macOS runner for full builds and a Linux runner to validate cross-compilation and image assembly on every push.
 
 ---
 
@@ -632,6 +694,6 @@ This repository contains code and binaries under multiple licenses:
 | Chameleon bootloader | Apple Public Source License 2.0 (derived from Apple `boot-132`) |
 | XFree86 / X.Org components (`Roots/X/`) | MIT X11 License |
 | MacPorts packages (`Roots/mp/`) | Various open-source licenses per package |
-| hexley9k additions (this README, `pd_build_source`) | BSD 2-Clause |
+| hexley9k additions (this README, `pd_build_source`, `pd_build_linux`, `pd_setup_linux`, `Dockerfile`, `docker-build.sh`) | BSD 2-Clause |
 
 Please read all applicable licenses before redistributing any portion of this software.

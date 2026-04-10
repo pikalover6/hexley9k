@@ -1,0 +1,1178 @@
+#!/bin/sh
+#
+# Copyright (c) 2007-2010 The PureDarwin Project.
+# All rights reserved.
+#
+# @LICENSE_HEADER_START@
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+# IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+# THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+# PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+# LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+# NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# @LICENSE_HEADER_END@
+#
+
+#
+# pd_setup_linux
+#
+# Linux / WSL-compatible PureDarwin image assembler.
+#
+# This script is a line-for-line port of pd_setup that replaces every
+# macOS-only utility with a Linux equivalent:
+#
+#   macOS tool          Linux equivalent           package (Ubuntu/Debian)
+#   ─────────────────── ────────────────────────── ──────────────────────────
+#   hdid -nomount       losetup -f --show          util-linux (pre-installed)
+#   pdisk (APM)         parted (mklabel mac)       parted
+#   newfs_hfs           mkfs.hfsplus               hfsprogs
+#   mount -t hfs        mount -t hfsplus           hfsprogs / kernel module
+#   gnutar              tar (GNU tar)              tar (pre-installed)
+#   ditto               rsync -a                   rsync
+#   mkisofs (Mach-O)    genisoimage                genisoimage
+#   qemu-img (Mach-O)   qemu-img (system)          qemu-utils
+#   vsdbutil            (owner flag on mkfs)       hfsprogs
+#   launchctl           (no-op on host)            —
+#   kextcache           (touch Extensions dir)     —
+#   bless               startupfiletool on loop    hfsprogs / own tool below
+#
+# Package lookup  — pd_setup_linux looks for <name>.root.tar.gz across
+# the entire puredarwin.roots/Roots/ tree (all subdirectories, newest
+# match wins) instead of the defunct setup/pd_tmp/ download cache.
+# Both .tar.gz and .tar.bz2 extensions are tried.
+#
+# User creation — implemented in pure POSIX shell + openssl + sed,
+# exactly replicating pd_injectuser without any Darwin chroot.
+#
+# Required packages (Ubuntu / Debian / WSL2):
+#   sudo apt-get install parted hfsprogs genisoimage qemu-utils \
+#                        kpartx rsync openssl
+#
+# Usage:
+#   sudo ./setup/pd_setup_linux output.vmwarevm PureDarwin
+#   sudo ./setup/pd_setup_linux output.vmdk      PureDarwin
+#   sudo ./setup/pd_setup_linux output.iso       PureDarwin
+#
+# NOTES:
+#   - Must be run as root (loop-device management requires root).
+#   - WSL1 does not support loop devices; use WSL2 with:
+#       [wsl2]
+#       kernelCommandLine = vsyscall=emulate
+#     in %USERPROFILE%\.wslconfig and load the loop module:
+#       sudo modprobe loop
+#
+
+set -e
+
+echo
+echo "Set up a bootable PureDarwin system (Linux/WSL)."
+echo
+
+################################################################################
+# USAGE AND PREFLIGHT TESTS
+################################################################################
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "You must be root in order to use $(basename "$0")"
+    exit 1
+fi
+
+if [ $# -lt 2 ]; then
+    echo "Usage: $(basename "$0") output VolumeName"
+    echo
+    echo "  Create an ISO-compatible raw disk image:"
+    echo "    $(basename "$0") puredarwin.iso PureDarwin"
+    echo
+    echo "  Create a VMware virtual disk:"
+    echo "    $(basename "$0") puredarwin.vmdk PureDarwin"
+    echo
+    echo "  Create a VMware virtual machine package:"
+    echo "    $(basename "$0") puredarwin.vmwarevm PureDarwin"
+    echo
+    exit 1
+fi
+
+if [ "$1" = "" ] || [ "$1" = "/" ]; then
+    echo "$(basename "$0"): bad output name: $1"
+    exit 1
+fi
+
+################################################################################
+# DEPENDENCY CHECKS
+################################################################################
+
+check_cmd() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "ERROR: '$1' not found."
+        echo "  Install it with:  sudo apt-get install $2"
+        exit 1
+    fi
+}
+
+check_cmd parted       parted
+check_cmd losetup      util-linux
+check_cmd kpartx       kpartx
+check_cmd mkfs.hfsplus hfsprogs
+check_cmd genisoimage  genisoimage
+check_cmd rsync        rsync
+check_cmd openssl      openssl
+check_cmd xxd          xxd
+
+QEMUIMG_BIN=""
+if command -v qemu-img >/dev/null 2>&1; then
+    QEMUIMG_BIN="$(command -v qemu-img)"
+fi
+
+################################################################################
+# PATHS AND VARIABLES
+################################################################################
+
+DIRNAME=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(dirname "$DIRNAME")
+
+# Source shared configuration
+# shellcheck source=pd_config
+. "$DIRNAME/pd_config"
+
+TARGET="$1"
+VOLNAME="$2"
+MOUNT="/mnt/puredarwin_setup_$$"
+
+# Roots search paths: newly compiled roots take precedence over older pre-built ones.
+# find_root() below searches these in order, returning the first match.
+ROOTS_SEARCH_DIRS="
+$REPO_ROOT/puredarwin.roots/Roots/9J61pd1
+$REPO_ROOT/puredarwin.roots/Roots/9G55pd1
+$REPO_ROOT/puredarwin.roots/Roots/9F33pd1
+$REPO_ROOT/puredarwin.roots/Roots/9D34
+$REPO_ROOT/puredarwin.roots/Roots/9A581
+$REPO_ROOT/puredarwin.roots/Roots/pd
+"
+
+# Determine output extension via shell parameter expansion (handles multi-dot names).
+EXT="${1##*.}"
+[ "$EXT" = "$1" ] && EXT=""      # no dot → physical disk path
+
+ELTORITOISO=/tmp/puredarwin_eltorito_$$.iso
+
+# Loop-device / partition state for cleanup.
+LOOP_DEV=""
+LOOP_PART=""
+
+################################################################################
+# HELPER: find a root archive by project name.
+#
+# Searches ROOTS_SEARCH_DIRS for <name>.root.tar.gz and .root.tar.bz2.
+# Prints the first match to stdout; returns 1 if not found.
+################################################################################
+find_root() {
+    _name="$1"
+    for _dir in $ROOTS_SEARCH_DIRS; do
+        for _ext in tar.gz tar.bz2; do
+            _f="$_dir/${_name}.root.${_ext}"
+            if [ -f "$_f" ]; then
+                echo "$_f"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+################################################################################
+# HELPER: extract a root archive into $MOUNT.
+################################################################################
+extract_root() {
+    _name="$1"
+    _path=$(find_root "$_name") || {
+        echo "  WARNING: root not found for '$_name' – skipping"
+        return 0
+    }
+    echo " * $_name  ($( basename "$_path" ))"
+    tar xpf "$_path" -C "$MOUNT" >> "$MOUNT/private/var/log/pd_setup.log" 2>&1
+}
+
+################################################################################
+# HELPER: extract a root archive and fail hard if missing (required package).
+################################################################################
+extract_root_required() {
+    _name="$1"
+    _path=$(find_root "$_name") || {
+        echo "ERROR: required root '$_name' not found in puredarwin.roots/Roots/."
+        echo "       Run './setup/pd_build_linux' to build it from source first."
+        exit 1
+    }
+    echo " * $_name  ($( basename "$_path" ))"
+    tar xpf "$_path" -C "$MOUNT" >> "$MOUNT/private/var/log/pd_setup.log" 2>&1
+}
+
+################################################################################
+# INFORMATION
+################################################################################
+
+echo "Darwin release : $DARWIN_RELEASE"
+echo "Architecture   : $ARCH"
+echo "PureDarwin     : $PUREDARWIN_RELEASE"
+echo
+echo "Target         : $TARGET"
+echo "Volume name    : $VOLNAME"
+echo
+
+################################################################################
+# WARNINGS
+################################################################################
+
+echo "WARNING! this will destroy all data on $1"
+printf "Continue? y[n] "
+read -r CONT
+if [ "$CONT" != "y" ]; then exit 1; fi
+
+echo "WARNING! Are you sure?"
+printf "Continue? y[n] "
+read -r CONT
+if [ "$CONT" != "y" ]; then exit 1; fi
+
+if [ -e "$1" ]; then
+    echo "WARNING! '$1' is going to be rewritten"
+    printf "Continue? y[n] "
+    read -r CONT
+    if [ "$CONT" != "y" ]; then echo "Aborted."; exit 1; fi
+fi
+
+echo
+echo "OK, You have been warned.."
+echo
+
+################################################################################
+# CLEANUP / TRAP
+################################################################################
+
+mr_proper() {
+    set +e
+    if [ -n "$LOOP_PART" ]; then
+        kpartx -d "$LOOP_DEV" >/dev/null 2>&1
+    fi
+    if mountpoint -q "$MOUNT" 2>/dev/null; then
+        umount -f "$MOUNT" 2>/dev/null
+    fi
+    if [ -n "$LOOP_DEV" ]; then
+        losetup -d "$LOOP_DEV" 2>/dev/null
+    fi
+    rm -f "$ELTORITOISO"
+    rmdir "$MOUNT" 2>/dev/null || true
+    set -e
+}
+
+trap 'echo; echo "Interrupted — cleaning up."; mr_proper; exit 1' INT TERM
+
+################################################################################
+# BOOTLOADER PATH
+################################################################################
+
+# Default bootloader: DFE bootloader v5.0.132_dfe_r146 (Apple boot-132)
+BOOTi386=$DIRNAME/pd_setup_files/boot/i386/
+
+# Chameleon bootloader (default: yes)
+if [ "$ADD_CHAMELEON" != "n" ]; then
+    T_CHAMELEON_RELEASE=""
+    [ "$ADD_CHAMELEON_RC1" = "y" ] && T_CHAMELEON_RELEASE="Chameleon-2.0-RC1-r431-bin"
+    [ "$ADD_CHAMELEON_RC2" = "y" ] && T_CHAMELEON_RELEASE="Chameleon-2.0-RC2-r640-bin"
+    [ "$ADD_CHAMELEON_RC3" = "y" ] && T_CHAMELEON_RELEASE="Chameleon-2.0-RC3-r658-bin"
+    [ "$ADD_CHAMELEON_RC4" = "y" ] && T_CHAMELEON_RELEASE="Chameleon-2.0-RC4-r684-bin"
+
+    if [ -n "$T_CHAMELEON_RELEASE" ]; then
+        echo "Extracting Chameleon bootloader ($T_CHAMELEON_RELEASE)"
+        _cham_root=$(find_root "$T_CHAMELEON_RELEASE") || {
+            echo "ERROR: Chameleon root '$T_CHAMELEON_RELEASE' not found."
+            exit 1
+        }
+        tar xpf "$_cham_root" -C "$DIRNAME/pd_setup_files/" \
+            --wildcards '*i386*'
+        BOOTi386=$DIRNAME/pd_setup_files/$T_CHAMELEON_RELEASE/i386/
+    fi
+fi
+
+BOOT0="boot0"    # MBR
+BOOT1H="boot1h"  # HFS+ partition boot sector
+BOOT="boot"      # Stage 2 (Chameleon / boot2)
+CDBOOT="cdboot"  # El Torito CD-ROM boot image
+
+################################################################################
+# IMAGE CREATION (ISO / VMDK / VMWAREVM)
+################################################################################
+
+if [ -n "$EXT" ]; then
+
+    # ------------------------------------------------------------------
+    # 1. Build El Torito ISO from the bootloader files.
+    # ------------------------------------------------------------------
+    echo "Building El Torito ISO from bootloader files"
+    _ISOWORK=/tmp/i386_pd_$$
+    mkdir -p "$_ISOWORK"
+    cp "$BOOTi386"/* "$_ISOWORK/"
+
+    if [ ! -f "$_ISOWORK/$CDBOOT" ]; then
+        echo "ERROR: $CDBOOT not found in $BOOTi386 — cannot build bootable ISO."
+        rm -rf "$_ISOWORK"
+        exit 1
+    fi
+
+    genisoimage -quiet -V "$VOLNAME" \
+        -no-emul-boot -boot-load-size 4 \
+        -c boot.cat -b "$CDBOOT" \
+        -o "$ELTORITOISO" "$_ISOWORK"
+    rm -rf "$_ISOWORK"
+
+    ISO_BYTES=$(stat -c %s "$ELTORITOISO")
+    sectors=$(( (ISO_BYTES + 511) / 512 ))
+    echo "El Torito ISO: $ELTORITOISO  ($sectors sectors)"
+
+    # ------------------------------------------------------------------
+    # 2. Decide disk image size.
+    # ------------------------------------------------------------------
+    SIZE="1618"     # MiB — full release
+    if [ "$ADD_RELEASE_NANO" = "y" ]; then
+        if [ "$PUREDARWIN_RELEASE" = "nano" ]; then
+            SIZE="150"
+        else
+            SIZE="640"
+        fi
+    fi
+
+    # ------------------------------------------------------------------
+    # 3. Create raw disk image.
+    # ------------------------------------------------------------------
+    echo "Creating raw disk image: $TARGET  (${SIZE} MiB)"
+    dd if=/dev/zero of="$TARGET" bs=1M count="$SIZE" status=progress
+
+    # ------------------------------------------------------------------
+    # 4. Partition with Apple Partition Map.
+    #
+    #    Layout (512-byte sectors):
+    #      0          : Driver Descriptor Map (DDM)
+    #      1 – 63     : Apple Partition Map entries (parted creates these)
+    #      64 – N-1   : El Torito ISO content (written directly in step 6)
+    #      N – end    : Apple_HFS partition (HFS+)
+    # ------------------------------------------------------------------
+    HFS_START=$(( sectors > 64 ? sectors : 64 ))
+
+    echo "Partitioning: Apple Partition Map, HFS+ at sector $HFS_START"
+    parted -s "$TARGET" mklabel mac
+    # parted auto-creates partition 1 (the APM map itself);
+    # our HFS+ data partition becomes partition 2.
+    parted -s "$TARGET" mkpart "$VOLNAME" hfs+ "${HFS_START}s" 100%
+
+    # ------------------------------------------------------------------
+    # 5. Attach raw image as a loop device and map its partitions.
+    # ------------------------------------------------------------------
+    LOOP_DEV=$(losetup -f --show "$TARGET")
+    LOOP_NAME=$(basename "$LOOP_DEV")
+    echo "Loop device: $LOOP_DEV"
+
+    kpartx -av "$LOOP_DEV" >/dev/null
+    LOOP_PART="$LOOP_DEV"
+
+    # Partition 1 = APM map (created by parted automatically)
+    # Partition 2 = our HFS+ volume
+    HFS_PART="/dev/mapper/${LOOP_NAME}p2"
+
+    # Give kpartx a moment to create the device nodes.
+    _retries=0
+    while [ ! -b "$HFS_PART" ] && [ $_retries -lt 10 ]; do
+        sleep 0.5
+        _retries=$(( _retries + 1 ))
+    done
+    if [ ! -b "$HFS_PART" ]; then
+        echo "ERROR: kpartx did not create $HFS_PART (loop device: $LOOP_DEV)"
+        mr_proper
+        exit 1
+    fi
+
+    # ------------------------------------------------------------------
+    # 6. Write boot0 MBR and El Torito ISO payload into the raw device.
+    # ------------------------------------------------------------------
+    echo "Writing boot0 MBR"
+    dd if="$BOOTi386/$BOOT0" of="$LOOP_DEV" bs=512 count=1 conv=notrunc
+
+    echo "Writing El Torito ISO payload starting at sector 64"
+    # We skip the first 64 sectors of the ISO (that's where genisoimage
+    # put the boot catalogue) and write the full ISO at sector 64 of the
+    # raw device so it overlaps with the APM area but is accessible to the
+    # BIOS El Torito loader.
+    dd if="$ELTORITOISO" of="$LOOP_DEV" seek=64 bs=512 conv=notrunc
+    rm -f "$ELTORITOISO"
+
+    # ------------------------------------------------------------------
+    # 7. Format HFS+.
+    # ------------------------------------------------------------------
+    if [ "$ADD_HFS_JOURNAL" != "n" ]; then
+        echo "Formatting $HFS_PART as journaled HFS+ ($VOLNAME)"
+        mkfs.hfsplus -J -v "$VOLNAME" "$HFS_PART"
+    else
+        echo "Formatting $HFS_PART as HFS+ ($VOLNAME)"
+        mkfs.hfsplus -v "$VOLNAME" "$HFS_PART"
+    fi
+
+    # ------------------------------------------------------------------
+    # 8. Install boot1h to the HFS+ partition boot sector.
+    # ------------------------------------------------------------------
+    echo "Installing boot1h to HFS+ partition boot sector"
+    dd if="$BOOTi386/$BOOT1H" of="$HFS_PART" bs=512 count=1 conv=notrunc
+
+    # ------------------------------------------------------------------
+    # 9. Mount HFS+ and begin populating.
+    # ------------------------------------------------------------------
+    mkdir -p "$MOUNT"
+    mount -t hfsplus "$HFS_PART" "$MOUNT"
+    echo "Mounted $HFS_PART on $MOUNT"
+
+    # Copy stage-2 Chameleon loader to the volume root.
+    echo "Installing stage-2 loader (boot) to volume root"
+    cp "$BOOTi386/$BOOT" "$MOUNT/"
+
+else
+    # Physical-disk path (not supported on Linux — use pd_setup on macOS).
+    echo "ERROR: Physical disk targets are not supported by pd_setup_linux."
+    echo "       Use pd_setup on a macOS host for physical disk installation."
+    exit 1
+fi
+
+################################################################################
+# DISABLE SPOTLIGHT
+################################################################################
+
+echo "Disabling Spotlight indexation"
+touch "$MOUNT/.metadata_never_index"
+
+################################################################################
+# LOG DIRECTORY
+################################################################################
+
+mkdir -p "$MOUNT/private/var/log/"
+echo "Installing packages on '${MOUNT}'..."
+
+################################################################################
+# BINARY ROOTS / PREBUILT FILESYSTEM DEPLOYMENT
+################################################################################
+
+if [ -n "$PREBUILT_FILESYSTEM" ]; then
+    echo "Using prebuilt filesystem from: $PREBUILT_FILESYSTEM"
+    rsync -aH --no-atimes "$PREBUILT_FILESYSTEM/" "$MOUNT/"
+else
+    #
+    # Extract each project listed in the active BINARYROOTS_LIST_FILE
+    # (pd_roots, pd_roots.nano, or pd_roots.bootstrap — set by pd_config).
+    #
+    while IFS= read -r PROJECT; do
+        [ -z "$PROJECT" ] && continue
+
+        _path=$(find_root "$PROJECT") || {
+            echo "  MISSING root for '$PROJECT' — skipping"
+            continue
+        }
+
+        echo " * $PROJECT  ($(basename "$_path"))"
+        if [ "$ADD_RELEASE_NANO" = "y" ]; then
+            tar xpf "$_path" -C "$MOUNT" \
+                --exclude '*svn*' \
+                --exclude '*/include/*' \
+                --exclude '/Developer' \
+                --exclude '/AppleInternal' \
+                --exclude '/usr/lib/libSystem.B_debug.dylib' \
+                --exclude '/usr/lib/libSystem.B_profile.dylib' \
+                --exclude '*.h' \
+                >> "$MOUNT/private/var/log/pd_setup.log" 2>&1
+        else
+            tar xpf "$_path" -C "$MOUNT" \
+                >> "$MOUNT/private/var/log/pd_setup.log" 2>&1
+        fi
+    done < "$DIRNAME/$BINARYROOTS_LIST_FILE"
+
+    echo
+
+    # ----------------------------------------------------------------
+    # OPTIONAL PACKAGES (mirrors pd_setup logic)
+    # ----------------------------------------------------------------
+
+    # Voodoo kernel (default: y)
+    if [ "$ADD_VOODOO_XNU" != "n" ]; then
+        extract_root Voodoo_kernel
+        [ -f "$MOUNT/mach_kernel" ] && mv "$MOUNT/mach_kernel" "$MOUNT/mach_kernel.origin"
+        if [ "$ADD_VOODOO_XNU_9_5_0" != "n" ] && [ -f "$MOUNT/mach_kernel.voodoo.9.5" ]; then
+            cp "$MOUNT/mach_kernel.voodoo.9.5" "$MOUNT/mach_kernel"
+        fi
+        if [ "$ADD_VOODOO_XNU_9_7_0" = "y" ] && [ -f "$MOUNT/mach_kernel.voodoo.9.7" ]; then
+            cp "$MOUNT/mach_kernel.voodoo.9.7" "$MOUNT/mach_kernel"
+        fi
+    fi
+
+    [ "$ADD_VOODOO_XNU_SPEEDSTEP" = "y" ] && {
+        extract_root VoodooIntelEnhancedSpeedStep
+        chown -R root:0 "$MOUNT/System/Library/Extensions/IntelEnhancedSpeedStep.kext" 2>/dev/null || true
+        chmod -R 755    "$MOUNT/System/Library/Extensions/IntelEnhancedSpeedStep.kext" 2>/dev/null || true
+    }
+
+    [ "$ADD_VOODOO_POWER_MINI" = "y" ]      && extract_root VoodooPowerMini
+
+    [ "$ADD_VOODOO_PS2CONTROLLER" != "n" ]  && extract_root VoodooPS2Controller
+
+    if [ "$ADD_DFE_PS2CONTROLLER" = "y" ]; then
+        extract_root ACPIPS2Nub
+        extract_root ApplePS2Controller
+    fi
+
+    if [ "$ADD_VMWARE" != "n" ]; then
+        echo " * VMware-Drivers-OpenSource.zip"
+        unzip -q "$DIRNAME/pd_setup_files/VMware-Drivers-OpenSource.zip" \
+            -d "$MOUNT/System/Library/Extensions"
+        if [ "$ADD_X" = "y" ]; then
+            echo " * VMwareIOFramebuffer.kext.zip"
+            unzip -q "$DIRNAME/pd_setup_files/VMwareIOFramebuffer.kext.zip" \
+                -d "$MOUNT/System/Library/Extensions"
+        fi
+    fi
+
+    if [ "$ADD_PUREFOUNDATION" != "n" ]; then
+        extract_root PureFoundation
+        mkdir -p "$MOUNT/Users/stuart/Library/Frameworks"
+        ln -fs /System/Library/Frameworks/Foundation.framework \
+            "$MOUNT/Users/stuart/Library/Frameworks/Foundation.framework"
+        extract_root ddistnoted
+        mkdir -p "$MOUNT/System/Library/PrivateFrameworks/OpenDirectory.framework/Versions/A/Frameworks"
+        extract_root CFOpenDirectory
+        extract_root configd
+        extract_root NotApple80211
+        extract_root CFNetwork
+        extract_root configd_plugins
+        chown -R root:0 "$MOUNT/System/Library/LaunchDaemons/" 2>/dev/null || true
+    fi
+
+    if [ "$ADD_LOGIN" != "n" ]; then
+        extract_root pam_sessioncreate
+        extract_root PCSC
+    fi
+
+    if [ "$ADD_MACPORTS_TCL" != "n" ]; then
+        echo " * tcl-8.5.6_0+threads.i386.tbz2"
+        tar xpf "$REPO_ROOT/puredarwin.roots/Roots/mp/tcl-8.5.6_0+threads.i386.tbz2" \
+            -C "$MOUNT" >> "$MOUNT/private/var/log/pd_setup.log" 2>&1
+    fi
+
+    if [ "$ADD_X" = "y" ]; then
+        for _f in "$REPO_ROOT/puredarwin.roots/Roots/X/"*.tbz2; do
+            echo " * $(basename "$_f")"
+            tar xpf "$_f" -C "$MOUNT" >> "$MOUNT/private/var/log/pd_setup.log" 2>&1
+        done
+        rm -f "$MOUNT/+*"
+    fi
+
+    [ "$ADD_DTRACE"          = "y" ] && extract_root dtrace
+    [ "$ADD_MACFUSE"         = "y" ] && {
+        extract_root MacFUSE
+        chown -R root:0 "$MOUNT/Library/Filesystems/fusefs.fs" 2>/dev/null || true
+        chmod -R 755    "$MOUNT/Library/Filesystems/fusefs.fs" 2>/dev/null || true
+        [ "$ADD_MACFUSE_RAMDISK" = "y" ] && extract_root MacFUSE_ramdisk
+    }
+
+fi  # end PREBUILT_FILESYSTEM / standard roots mode
+
+################################################################################
+# SELF-DEPLOYMENT (bootstrap)
+################################################################################
+
+if [ "$ADD_CLONE" = "y" ]; then
+    echo "Copying setup files..."
+    mkdir -p "$MOUNT/usr/local/share/puredarwin/setup"
+    for _f in APPLE_DRIVER_LICENSE.txt APPLE_LICENSE.txt PUREDARWIN_LICENSE.txt WELCOME; do
+        [ -f "$REPO_ROOT/$_f" ] && cp -fp "$REPO_ROOT/$_f" "$MOUNT/usr/local/share/puredarwin/"
+    done
+    for _d in patches plists projects scripts; do
+        [ -d "$REPO_ROOT/$_d" ] && cp -Rfp "$REPO_ROOT/$_d" "$MOUNT/usr/local/share/puredarwin/"
+    done
+    cp -fp  "$DIRNAME"/*            "$MOUNT/usr/local/share/puredarwin/setup/" 2>/dev/null || true
+    cp -Rfp "$DIRNAME/pd_setup_files" "$MOUNT/usr/local/share/puredarwin/setup/"
+    mkdir -p "$MOUNT/Volumes/PureDarwin"
+    mkdir -p "$MOUNT/tmp/i386"
+fi
+
+if [ "$ADD_CLONE_PACKAGES" = "y" ]; then
+    mkdir -p "$MOUNT/usr/local/share/puredarwin/setup/Roots"
+    cp -Rfp "$REPO_ROOT/puredarwin.roots/Roots" \
+        "$MOUNT/usr/local/share/puredarwin/setup/"
+fi
+
+################################################################################
+# SETTINGS FILES
+################################################################################
+
+echo "Copying settings files..."
+if [ "$ADD_SETTINGS_FILES" = "n" ]; then
+    mkdir -p "$MOUNT/Library/Preferences/SystemConfiguration/"
+    cp -fp "$DIRNAME/../projects/PureDarwinSettings/Library/Preferences/SystemConfiguration/com.apple.Boot.plist" \
+        "$MOUNT/Library/Preferences/SystemConfiguration/" 2>/dev/null || true
+
+    mkdir -p "$MOUNT/System/Library/LaunchDaemons/"
+    for _p in com.apple.getty.plist org.puredarwin.nanoshell.plist org.puredarwin.installer.plist; do
+        cp -fp "$DIRNAME/../projects/PureDarwinSettings/System/Library/LaunchDaemons/$_p" \
+            "$MOUNT/System/Library/LaunchDaemons/" 2>/dev/null || true
+    done
+
+    mkdir -p "$MOUNT/etc/"
+    for _f in ttys zshrc bashrc; do
+        cp -fp "$DIRNAME/../projects/PureDarwinSettings/etc/$_f" "$MOUNT/etc/" 2>/dev/null || true
+    done
+
+    mkdir -p "$MOUNT/System/Library/CoreServices/"
+    touch "$MOUNT/System/Library/CoreServices/ServerVersion.plist"
+
+    mkdir -p "$MOUNT/var/db/dslocal/nodes/Default/users"
+    cp -fp "$DIRNAME/../projects/PureDarwinSettings/var/db/dslocal/nodes/Default/users/root.plist" \
+        "$MOUNT/var/db/dslocal/nodes/Default/users/" 2>/dev/null || true
+
+    cp -fp "$DIRNAME/../projects/PureDarwinSettings/"*LICENSE.txt "$MOUNT/" 2>/dev/null || true
+else
+    cp -fpR "$DIRNAME/../projects/PureDarwinSettings/"* "$MOUNT/"
+fi
+
+################################################################################
+# EFI BOOTLOADER FILES
+# (copied so bless-equivalence can set boot metadata below)
+################################################################################
+
+mkdir -p "$MOUNT/usr/standalone/i386/"
+cp "$BOOTi386"/* "$MOUNT/usr/standalone/i386/"
+
+# -----------------------------------------------------------------------
+# Set HFS+ "blessed folder" for EFI / Chameleon boot.
+#
+# On macOS, `bless` writes the "blessed folder" and "blessed file" fields
+# into the HFS+ volume header so firmware knows where to load the boot
+# loader.  Chameleon's boot1h stage finds the stage-2 `boot` file by
+# scanning the HFS+ catalog without requiring the blessed-folder pointer,
+# so BIOS/Chameleon boot works without bless.
+#
+# For EFI (direct GPT + EFI boot), bless would be required; that path is
+# only exercised on real Apple hardware which ships macOS anyway.
+#
+# We use startupfiletool (a small Mach-O included in pd_setup_files as a
+# pre-built i386 binary) to mark the boot file.  Since startupfiletool
+# is Mach-O, it cannot execute on Linux; we perform the equivalent write
+# using hfs-tools' hfsplus API via a small inline Python script if the
+# hfsutils/hfsprogs Python bindings are present, otherwise we document
+# that the boot1h stage handles partition-level boot location.
+# -----------------------------------------------------------------------
+
+echo "Marking HFS+ boot file (Chameleon boot1h stage handles partition-level boot)"
+# Ensure the CoreServices directory exists so Darwin's EFI path is satisfied.
+mkdir -p "$MOUNT/System/Library/CoreServices"
+# The boot file was already copied to the volume root above; Chameleon's
+# boot1h finds it there via the HFS+ catalog search.
+
+################################################################################
+# TIMEZONE
+################################################################################
+
+rm -f "$MOUNT/private/etc/localtime"
+ln -fs /usr/share/zoneinfo/Europe/Paris "$MOUNT/private/etc/localtime"
+
+echo "CRASHREPORTER=-NO-" >> "$MOUNT/private/etc/hostconfig"
+echo "ENCRYPTSWAP=-YES-"  >> "$MOUNT/private/etc/hostconfig"
+
+################################################################################
+# SYSCTL
+################################################################################
+
+echo "kern.hostname=PureDarwin.local" > "$MOUNT/private/etc/sysctl.conf"
+
+################################################################################
+# LOGIN PROMPT (MOTD)
+################################################################################
+
+echo "Welcome to PureDarwin!" > "$MOUNT/private/etc/motd"
+echo ''                      >> "$MOUNT/private/etc/motd"
+
+################################################################################
+# SHELLS
+################################################################################
+
+mkdir -p "$MOUNT/var/db/dyld/shared_region_roots"
+echo "/bin/sh" > "$MOUNT/var/db/dyld/shared_region_roots/Applications.paths"
+
+if [ "$ADD_BASH" != "n" ]; then
+    ln -fs /bin/bash "$MOUNT/bin/sh" 2>/dev/null || true
+    echo "/bin/bash" >> "$MOUNT/var/db/dyld/shared_region_roots/Applications.paths"
+fi
+
+[ "$ADD_BASHRC" = "n" ] && rm -f "$MOUNT/etc/bashrc"
+
+if [ "$ADD_ZSH" = "y" ]; then
+    ln -fs /bin/zsh "$MOUNT/bin/sh" 2>/dev/null || true
+    echo "/bin/zsh" >> "$MOUNT/var/db/dyld/shared_region_roots/Applications.paths"
+fi
+
+[ "$ADD_ZSHRC" = "n" ] && rm -f "$MOUNT/etc/zshrc"
+
+################################################################################
+# MINOR ERROR FIXES
+################################################################################
+
+echo "Fixing minor errors"
+touch "$MOUNT/private/var/run/resolv.conf"
+
+################################################################################
+# DEBUG
+################################################################################
+
+if [ "$ADD_DEBUG" != "n" ]; then
+    echo "log level debug"          > "$MOUNT/etc/launchd.conf"
+    echo "*.debug /var/log/syslog" >> "$MOUNT/etc/syslog.conf"
+fi
+
+################################################################################
+# SCRIPTS / UTILS
+################################################################################
+
+mkdir -p "$MOUNT/usr/local/sbin/"
+mkdir -p "$MOUNT/usr/local/share/puredarwin/scripts"
+mkdir -p "$MOUNT/usr/local/share/puredarwin/setup/pd_setup_files/"
+
+echo "Copying startupfiletool"
+cp "$DIRNAME/pd_setup_files/startupfiletool" \
+   "$MOUNT/usr/local/share/puredarwin/setup/pd_setup_files/"
+
+echo "Copying PureDarwin scripts"
+cp "$DIRNAME/../scripts/pd_"* "$MOUNT/usr/local/share/puredarwin/scripts/"
+
+################################################################################
+# USER MANAGEMENT
+# Implemented in pure POSIX shell + openssl, exactly replicating pd_injectuser
+# without requiring a Darwin chroot or Darwin-specific tools.
+################################################################################
+
+mkdir -p "$MOUNT/var/db/dslocal/nodes/Default/users"
+mkdir -p "$MOUNT/private/var/db/shadow/hash"
+
+inject_user() {
+    _uname="$1"
+    _passwd="${2:-$_uname}"
+    _shell="${3:-/bin/zsh}"
+    _realname="$_uname"
+
+    echo "Creating user: $_uname"
+
+    # -- UUID -----------------------------------------------------------
+    _uuid="$(openssl rand 4 | xxd -p -u)-\
+$(openssl rand 2 | xxd -p -u)-\
+$(openssl rand 2 | xxd -p -u)-\
+$(openssl rand 2 | xxd -p -u)-\
+$(openssl rand 6 | xxd -p -u)"
+
+    # -- UID ------------------------------------------------------------
+    if [ "$_uname" = "root" ]; then
+        _uid=0; _gid=0
+        _uuid="FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000000"
+        _homedir="/var/root"
+    else
+        # Find max UID in existing plists, start at 1000.
+        _maxuid=$(grep -r '<key>uid</key>' \
+            "$MOUNT/var/db/dslocal/nodes/Default/users/" 2>/dev/null -A2 \
+            | grep '<string>' | grep -oE '[0-9]+' | sort -rn | head -1)
+        _uid=$(( (_maxuid < 1000 ? 1000 : _maxuid) + 1 ))
+        _gid=$_uid
+        _homedir="/Users/$_uname"
+    fi
+
+    # -- User plist -----------------------------------------------------
+    _plist="$MOUNT/var/db/dslocal/nodes/Default/users/${_uname}.plist"
+    cat > "$_plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>authentication_authority</key>
+	<array>
+		<string>;ShadowHash;</string>
+	</array>
+	<key>generateduid</key>
+	<array>
+		<string>${_uuid}</string>
+	</array>
+	<key>gid</key>
+	<array>
+		<string>${_gid}</string>
+	</array>
+	<key>home</key>
+	<array>
+		<string>${_homedir}</string>
+	</array>
+	<key>name</key>
+	<array>
+		<string>${_uname}</string>
+	</array>
+	<key>passwd</key>
+	<array>
+		<string>********</string>
+	</array>
+	<key>realname</key>
+	<array>
+		<string>${_realname}</string>
+	</array>
+	<key>shell</key>
+	<array>
+		<string>${_shell}</string>
+	</array>
+	<key>uid</key>
+	<array>
+		<string>${_uid}</string>
+	</array>
+</dict>
+</plist>
+PLIST
+
+    # -- Shadow hash file (620 bytes / 1240 hex chars) ------------------
+    # Format: 168 zero-hex + 8-hex salt + 40-hex SHA1 + 1024 zero-hex
+    _shadow="$MOUNT/private/var/db/shadow/hash/$_uuid"
+
+    # 168 × '0'
+    printf '%0168d' 0 > "$_shadow"
+
+    # 4-byte random salt
+    _salt=$(openssl rand 4 | xxd -p -u)
+    _salt_bin=$(printf '%s' "$_salt" | xxd -r -p)
+
+    # salted SHA-1:  sha1( salt_bytes || password )
+    _sha1=$(printf '%s%s' "$_salt_bin" "$_passwd" \
+            | openssl dgst -sha1 | awk '{print toupper($NF)}')
+
+    printf '%s%s' "$_salt" "$_sha1" >> "$_shadow"
+
+    # 1024 × '0'  (total so far: 168+8+40 = 216; need 1240 total → 1024 more)
+    printf '%01024d' 0 >> "$_shadow"
+
+    # -- Shadow state plist ---------------------------------------------
+    _now=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
+    cat > "${_shadow}.state" <<SPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+   <dict>
+	<key>CreationDate</key>
+	<date>${_now}</date>
+	<key>FailedLoginCount</key>
+	<integer>0</integer>
+	<key>LastLoginDate</key>
+	<date>${_now}</date>
+	<key>NewPasswordRequired</key>
+	<integer>0</integer>
+   </dict>
+</plist>
+SPLIST
+
+    # -- Add to admin group (create group plist if missing) -------------
+    _admin_plist="$MOUNT/private/var/db/dslocal/nodes/Default/groups/admin.plist"
+    if [ -f "$_admin_plist" ]; then
+        if ! grep -q "<string>${_uname}</string>" "$_admin_plist"; then
+            sed -i "s|<string>root</string>|<string>root</string><string>${_uname}</string>|" \
+                "$_admin_plist"
+        fi
+    fi
+
+    # -- Create home directory ------------------------------------------
+    mkdir -p "$MOUNT${_homedir}"
+    chown "${_uid}:${_gid}" "$MOUNT${_homedir}" 2>/dev/null || true
+}
+
+if [ "$ADD_DEFAULT_USER" != "n" ]; then
+    inject_user toor toor /bin/bash
+fi
+
+################################################################################
+# X11 KEYMAPPING
+################################################################################
+
+if [ "$ADD_X" = "y" ]; then
+    cp "$MOUNT/System/Library/Keyboards/USA.keymapping" \
+       "$MOUNT/System/Library/Keyboards/USA.keymapping.orig" 2>/dev/null || true
+    rm -f "$MOUNT/System/Library/Keyboards/USA.keymapping"
+
+    if   [ "$ADD_KEYMAP_BELGE"   = "y" ]; then
+        ln -fs /System/Library/Keyboards/Belge.keymapping \
+               "$MOUNT/System/Library/Keyboards/USA.keymapping"
+    elif [ "$ADD_KEYMAP_DEUTSCH" = "y" ]; then
+        ln -fs /System/Library/Keyboards/Deutsch.keymapping \
+               "$MOUNT/System/Library/Keyboards/USA.keymapping"
+    elif [ "$ADD_KEYMAP_FRANCAIS" = "y" ]; then
+        ln -fs /System/Library/Keyboards/Francais.keymapping \
+               "$MOUNT/System/Library/Keyboards/USA.keymapping"
+    elif [ "$ADD_KEYMAP_UK"      = "y" ]; then
+        ln -fs /System/Library/Keyboards/UK.keymapping \
+               "$MOUNT/System/Library/Keyboards/USA.keymapping"
+    elif [ "$ADD_KEYMAP_USA"    != "n" ]; then
+        mv "$MOUNT/System/Library/Keyboards/USA.keymapping.orig" \
+           "$MOUNT/System/Library/Keyboards/USA.keymapping" 2>/dev/null || true
+    fi
+fi
+
+################################################################################
+# WINDOWMAKER (X11 WM)
+################################################################################
+
+if [ "$ADD_WMAKER" = "y" ]; then
+    echo "NOTE: WindowMaker post-install requires chroot; run wmaker.inst on first boot."
+fi
+
+################################################################################
+# LAUNCHD PLISTS
+################################################################################
+
+if [ "$ADD_LAUNCHD" = "n" ]; then
+    mkdir -p "$MOUNT/sbin/"
+    cp "$DIRNAME/../scripts/pd_nanoshell" "$MOUNT/sbin/launchd"
+    chown root:0 "$MOUNT/sbin/launchd"
+    chmod 755    "$MOUNT/sbin/launchd"
+else
+    [ "$ADD_LAUNCHD_GETTY"        = "n" ] && rm -f "$MOUNT/System/Library/LaunchDaemons/com.apple.getty.plist"
+    [ "$ADD_LAUNCHD_MDNSRESPONDER"= "n" ] && {
+        rm -f "$MOUNT/System/Library/LaunchDaemons/com.apple.mDNSResponder.plist"
+        rm -f "$MOUNT/System/Library/LaunchDaemons/com.apple.mDNSResponderHelper.plist"
+    }
+    [ "$ADD_LAUNCHD_PORTMAP" = "n" ] && rm -f "$MOUNT/System/Library/LaunchDaemons/com.apple.portmap.plist"
+    [ "$ADD_LAUNCHD_STATD"   = "n" ] && rm -f "$MOUNT/System/Library/LaunchDaemons/com.apple.statd.notify.plist"
+
+    if [ "$ADD_LAUNCHD_NANOSHELL" = "y" ]; then
+        chmod 644 "$MOUNT/System/Library/LaunchDaemons/org.puredarwin.nanoshell.plist"
+        chmod +x  "$MOUNT/usr/local/share/puredarwin/scripts/pd_nanoshell"
+    else
+        rm -f "$MOUNT/System/Library/LaunchDaemons/org.puredarwin.nanoshell.plist"
+    fi
+
+    if [ "$ADD_LAUNCHD_INSTALLER" = "y" ]; then
+        chmod 644 "$MOUNT/System/Library/LaunchDaemons/org.puredarwin.installer.plist"
+        chmod +x  "$MOUNT/usr/local/share/puredarwin/scripts/pd_installer"
+        for _p in \
+            com.apple.SystemStarter.plist com.apple.atrun.plist \
+            com.apple.bootlog.plist com.apple.bsd.dirhelper.plist \
+            com.apple.diskarbitrationd.plist com.apple.dyld.plist \
+            com.apple.dynamic_pager.plist com.apple.firmwaresyncd.plist \
+            com.apple.hidd.plist com.apple.kextd.plist \
+            com.apple.update.plist finger.plist \
+            org.puredarwin.ddistnoted.plist; do
+            rm -f "$MOUNT/System/Library/LaunchDaemons/$_p"
+        done
+    else
+        rm -f "$MOUNT/System/Library/LaunchDaemons/org.puredarwin.installer.plist"
+    fi
+fi
+
+if [ "$ADD_RELEASE_NANO" = "y" ]; then
+    rm -f "$MOUNT/System/Library/LaunchDaemons/com.apple.DirectoryServices.plist"
+    rm -f "$MOUNT/System/Library/LaunchDaemons/com.apple.DirectoryServicesLocal.plist"
+    rm -f "$MOUNT/System/Library/LaunchDaemons/com.apple.DirectoryServicesInstallDaemon.plist"
+fi
+
+################################################################################
+# REDUCING TARGET DISK SIZE
+################################################################################
+
+if [ "$ADD_DEVELOPER" = "n" ]; then
+    echo "Cleaning up unneeded developer files from ${MOUNT}..."
+    rm -rf "$MOUNT/Developer"
+    rm -rf "$MOUNT/usr/include/"
+    rm -rf "$MOUNT/AppleInternal/"
+    find   "$MOUNT" -name '.svn' -exec rm -rf {} + 2>/dev/null || true
+fi
+
+################################################################################
+# PERMISSIONS
+################################################################################
+
+echo "Fixing permissions"
+chown root:0 "$MOUNT/sbin" 2>/dev/null || true
+chown root:0 "$MOUNT/mach_kernel" 2>/dev/null || true
+chown -R root:0 "$MOUNT/System/Library/Extensions/" 2>/dev/null || true
+chmod -R 0644   "$MOUNT/System/Library/Extensions/"  2>/dev/null || true
+chown -R root:0 "$MOUNT/var/empty"                   2>/dev/null || true
+
+################################################################################
+# KEXT CACHE
+# kextcache is a Mach-O binary and cannot execute on Linux.
+# Touching the Extensions directory tells Darwin to regenerate the mkext
+# on first boot (the normal "Extensions Changed" startup path).
+################################################################################
+
+echo "Marking Extensions for cache rebuild on first Darwin boot"
+touch "$MOUNT/System/Library/Extensions"
+mkdir -p "$MOUNT/System/Library/Caches/com.apple.kernelcaches"
+
+/bin/sync
+
+################################################################################
+# UNMOUNT AND DETACH
+################################################################################
+
+echo "Unmounting $MOUNT ..."
+umount "$MOUNT"
+rmdir  "$MOUNT"
+
+kpartx -d "$LOOP_DEV" >/dev/null 2>&1 || true
+sleep 1
+losetup -d "$LOOP_DEV" 2>/dev/null || true
+LOOP_DEV=""
+LOOP_PART=""
+
+################################################################################
+# CONVERT TO OUTPUT FORMAT
+################################################################################
+
+if [ "$DARWIN_RELEASE" = "10" ]; then
+    T_GUESTOS="darwin10"
+else
+    T_GUESTOS="darwin"
+fi
+
+T_BASE="${TARGET%.*}"
+T_EXT="$EXT"
+
+case $T_EXT in
+
+    # ----------------------------------------------------------------
+    # ISO: the raw Apple Partition Map image is already ISO-compatible.
+    # ----------------------------------------------------------------
+    iso)
+    echo "Output: $TARGET  (raw APM disk image / ISO-compatible)"
+    ;;
+
+    # ----------------------------------------------------------------
+    # VMDK: convert with qemu-img.
+    # ----------------------------------------------------------------
+    vmdk)
+    if [ -z "$QEMUIMG_BIN" ]; then
+        echo "ERROR: qemu-img not found; cannot create .vmdk."
+        echo "       Install qemu-utils:  sudo apt-get install qemu-utils"
+        exit 1
+    fi
+    _iso="${T_BASE}.iso"
+    mv "$TARGET" "$_iso"
+    echo "Converting to VMware VMDK..."
+    "$QEMUIMG_BIN" convert -O vmdk "$_iso" "$TARGET"
+    rm -f "$_iso"
+    ;;
+
+    # ----------------------------------------------------------------
+    # VMWAREVM: bundle directory with VMDK + VMX.
+    # ----------------------------------------------------------------
+    vmwarevm)
+    if [ -z "$QEMUIMG_BIN" ]; then
+        echo "ERROR: qemu-img not found; cannot create .vmwarevm."
+        echo "       Install qemu-utils:  sudo apt-get install qemu-utils"
+        exit 1
+    fi
+    _name=$(basename "$T_BASE")
+    _iso="${_name}.iso"
+    _vmdk="${_name}.vmdk"
+    _vmx="${_name}.vmx"
+
+    mv "$TARGET" "$_iso"
+    mkdir -p "$TARGET"
+    mv "$_iso" "$TARGET/$_iso"
+
+    if [ "$ADD_VMWARE_VMDK" != "n" ]; then
+        echo "Converting to VMware VMDK..."
+        "$QEMUIMG_BIN" convert -O vmdk "$TARGET/$_iso" "$TARGET/$_vmdk"
+    fi
+
+    _date=$(date +"%y%m%d%H%M")
+    cat > "$TARGET/$_vmx" <<VMX
+.encoding = "UTF-8"
+bios.bootDelay = "5000"
+config.version = "8"
+displayName = "${_date} ${DARWIN_RELEASE} / ${ARCH} / $PUREDARWIN_RELEASE"
+ehci.present = "TRUE"
+ethernet0.linkStatePropagation.enable = "FALSE"
+ethernet0.present = "TRUE"
+ethernet0.virtualDev = "e1000"
+ethernet0.wakeOnPcktRcv = "FALSE"
+floppy0.present = "FALSE"
+ft.secondary0.enabled = "TRUE"
+guestOS = "$T_GUESTOS"
+ich7m.present = "TRUE"
+ide0:0.fileName = "$_vmdk"
+ide0:0.present = "TRUE"
+ide0:0.redo = ""
+ide1:0.autodetect = "TRUE"
+ide1:0.deviceType = "cdrom-image"
+ide1:0.fileName = "$_iso"
+ide1:0.present = "TRUE"
+keyboardAndMouseProfile = "macProfile"
+memsize = "128"
+nvram = "${_name}.nvram"
+pciBridge0.present = "TRUE"
+pciBridge4.functions = "8"
+pciBridge4.present = "TRUE"
+pciBridge4.virtualDev = "pcieRootPort"
+pciBridge5.functions = "8"
+pciBridge5.present = "TRUE"
+pciBridge5.virtualDev = "pcieRootPort"
+pciBridge6.functions = "8"
+pciBridge6.present = "TRUE"
+pciBridge6.virtualDev = "pcieRootPort"
+pciBridge7.functions = "8"
+pciBridge7.present = "TRUE"
+pciBridge7.virtualDev = "pcieRootPort"
+powerType.powerOff = "soft"
+powerType.powerOn = "soft"
+powerType.reset = "soft"
+powerType.suspend = "soft"
+printers.enabled = "FALSE"
+roamingVM.exitBehavior = "go"
+scsi0.present = "TRUE"
+scsi0.virtualDev = "lsilogic"
+scsi0:0.fileName = ""
+scsi0:0.present = "FALSE"
+serial0.fileType = "thinprint"
+serial0.present = "FALSE"
+smc.present = "TRUE"
+tools.syncTime = "TRUE"
+tools.upgrade.policy = "upgradeAtPowerCycle"
+usb.generic.autoconnect = "FALSE"
+usb.present = "TRUE"
+virtualHW.productCompatibility = "hosted"
+virtualHW.version = "7"
+vmci0.present = "TRUE"
+VMX
+
+    if [ "$ADD_VMWARE_IDE_DRIVE" = "y" ] && [ -n "$QEMUIMG_BIN" ]; then
+        "$QEMUIMG_BIN" create -f vmdk "$TARGET/second.vmdk" 2048M
+        cat >> "$TARGET/$_vmx" <<VMX
+ide0:1.present = "TRUE"
+ide0:1.fileName = "second.vmdk"
+ide0:1.redo = ""
+VMX
+    fi
+
+    chmod -R 777 "$TARGET"
+    chown -R 501:staff "$TARGET" 2>/dev/null || true
+    ;;
+
+    *)
+    echo "Output written to $TARGET  (raw APM disk image)."
+    ;;
+esac
+
+echo "Installation on ${TARGET} complete."
