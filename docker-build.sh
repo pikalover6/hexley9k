@@ -75,9 +75,7 @@ run_in_docker() {
 if [ "$ASSEMBLE_ONLY" = "1" ]; then
     echo "--- Assembling disk image only ---"
     run_in_docker \
-        "cd /repo && sudo ./setup/pd_setup_linux puredarwin.vmwarevm PureDarwin <<< 'y
-y
-y'"
+        "cd /repo && printf 'y\ny\ny\n' | sudo ./setup/pd_setup_linux puredarwin.vmwarevm PureDarwin"
 elif [ "$BUILD_ONLY" = "1" ]; then
     echo "--- Compiling Darwin sources only ---"
     run_in_docker \

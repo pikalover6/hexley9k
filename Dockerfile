@@ -73,6 +73,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV SDK=/opt/darwin9-sdk
 
 # Fetch XNU kernel headers (Darwin 9.7.0 = XNU 1228.15.4)
+# Both tags point to the same source; the ".0.1" suffix is the macOS build number
+# used on some mirrors.  We try the shorter form first.
 RUN git clone --depth 1 \
         --branch xnu-1228.15.4 \
         https://github.com/apple-oss-distributions/xnu \

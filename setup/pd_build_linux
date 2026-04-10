@@ -81,6 +81,25 @@ SRC_APPLE="$REPO_ROOT/source/apple"
 SRC_THIRD="$REPO_ROOT/source/third_party"
 ROOTS_OUT="$REPO_ROOT/puredarwin.roots/Roots/9J61pd1"
 BUILD_DIR="/tmp/pd_build_linux_$$"
+BUILD_LOG_DIR="$REPO_ROOT/puredarwin.roots/Roots/9J61pd1/build-logs"
+
+# Set PD_BUILD_VERBOSE=1 to see full compiler output instead of tail-5.
+PD_BUILD_VERBOSE="${PD_BUILD_VERBOSE:-0}"
+
+_cc_run() {
+    # Run a compiler command, logging full output; on failure print tail of log.
+    _log="$1"; shift
+    "$@" > "$_log" 2>&1 || {
+        echo "  FAILED: $*"
+        if [ "$PD_BUILD_VERBOSE" = "1" ]; then
+            cat "$_log"
+        else
+            echo "  --- last 10 lines (set PD_BUILD_VERBOSE=1 for full output) ---"
+            tail -10 "$_log"
+        fi
+        return 1
+    }
+}
 
 # Darwin target triple and SDK path (can be overridden in the environment)
 DARWIN_TARGET="${DARWIN_TARGET:-i386-apple-darwin9}"
@@ -147,6 +166,7 @@ fi
 
 mkdir -p "$ROOTS_OUT"
 mkdir -p "$BUILD_DIR"
+mkdir -p "$BUILD_LOG_DIR"
 
 ################################################################################
 # HELPER FUNCTIONS
@@ -230,13 +250,14 @@ build_libdwarf() {
     mkdir -p "$_dstroot/usr/lib" "$_dstroot/usr/include" "$_dstroot/usr/bin"
 
     # libdwarf uses its own non-autoconf Makefile; invoke it with cross-compile vars.
+    _log="$_bdir/build.log"
     make -C "$_src" \
         SRCROOT="$_src" \
         OBJROOT="$_bdir" \
         DSTROOT="$_dstroot" \
         CC="$CC" \
         RC_CFLAGS="$EXTRA_CFLAGS" \
-        -j"$(nproc)" || true
+        -j"$(nproc)" > "$_log" 2>&1 || { echo "  make failed (see $_log)"; cat "$_log" | tail -20; }
 
     package_root libdwarf "$_dstroot"
 }
@@ -290,7 +311,9 @@ build_CF() {
     for _f in $_all_c; do
         _base=$(basename "$_f" .c)
         _obj="$_objbase/normal/${_base}.o"
-        $CC $_cflags "$_src/$_f" -o "$_obj" 2>&1 | head -5 || true
+        _log="$BUILD_LOG_DIR/CF-${_base}.log"
+        _cc_run "$_log" \
+            $CC $_cflags "$_src/$_f" -o "$_obj" || true
         _objs="$_objs $_obj"
     done
 
@@ -301,7 +324,9 @@ build_CF() {
     esac
 
     echo "  Linking CoreFoundation.dylib..."
-    $CC -dynamiclib \
+    _log="$BUILD_LOG_DIR/CF-link.log"
+    _cc_run "$_log" \
+        $CC -dynamiclib \
         -mmacosx-version-min=10.5 \
         -install_name /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation \
         -compatibility_version 150 \
@@ -312,7 +337,7 @@ build_CF() {
         $_objs \
         -licucore \
         -lobjc \
-        -o "$_objbase/CoreFoundation" 2>&1 | head -10 || true
+        -o "$_objbase/CoreFoundation" || true
 
     # Install into a framework layout.
     _fwroot="$_dstroot/System/Library/Frameworks/CoreFoundation.framework"
