@@ -2,8 +2,7 @@
 
 **hexley9k** is a project to retromod [PureDarwin Xmas](http://www.puredarwin.org/developers/xmas) — the 2008 community proof-of-concept release of Darwin 9 (the open-source core of Mac OS X Leopard 10.5.x). The immediate goal is a fully self-contained, reproducible build system capable of producing a bootable PureDarwin Xmas VMware image from source. Longer-term goals include updating components, improving hardware support, and exploring what a modern Darwin userland could look like.
 
-The project is named after [Hexley](https://en.wikipedia.org/wiki/Hexley), the Darwin BSD daemon mascot. The `9k` refers to Darwin 9 (XNU 1228).
-
+<img width="1672" height="941" alt="9a248216-e77f-4991-b2ce-efb1d827420b" src="https://github.com/user-attachments/assets/2d8a3005-7bd6-4030-b100-ec0a5b945c5a" />
 ---
 
 ## Table of Contents
