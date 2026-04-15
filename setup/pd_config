@@ -168,7 +168,7 @@ ADD_CHAMELEON_RC4="y"		# (default: n) EXCLUSIVE Choose Chameleon 2.0-RC4-r684?
 
 ADD_MBR_ERASE="y"		# (default: y) Erase existing partition table (instead of updating the MBR)?
 
-ADD_HFS_JOURNAL="y"		# (default: y) Create a journaled HFS+ volume
+ADD_HFS_JOURNAL="n"		# (default: y) Create a journaled HFS+ volume
 
 ADD_VOODOO_XNU="y"		# (default: y) Add Voodoo Xnu-dev kernels ?
 # On 9.7, problems with disk0s1: ioctl(_IOW,'d',31,32) is unsupported

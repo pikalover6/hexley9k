@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 #
 # Copyright (c) 2007-2010 The PureDarwin Project.
 # All rights reserved.
@@ -171,6 +171,17 @@ EXT="${1##*.}"
 
 ELTORITOISO=/tmp/puredarwin_eltorito_$$.iso
 
+# For the .vmwarevm bundle format the script cannot write the raw disk image
+# directly to $TARGET on Docker/WSL2 volume mounts (the path may be ghost-
+# stuck as a directory due to virtiofs state).  Use a sibling temp file on
+# the SAME volume mount (not tmpfs) — virtiofs/NTFS-backed loop devices work
+# correctly with guestmount whereas tmpfs-backed ones do not.
+if [ "$EXT" = "vmwarevm" ]; then
+    RAW_TARGET="${TARGET%.*}_rawdisk.img"
+else
+    RAW_TARGET="$TARGET"
+fi
+
 # Loop-device / partition state for cleanup.
 LOOP_DEV=""
 LOOP_PART=""
@@ -259,22 +270,50 @@ echo
 echo "OK, You have been warned.."
 echo
 
+# Remove any pre-existing target (file, directory, or partial bundle).
+# On Docker/Windows volume mounts the previous mv+mkdir dance can leave
+# a stale directory entry that persists between container runs.
+rm -rf "$TARGET" "$RAW_TARGET" 2>/dev/null || true
+
+# Clean up any loop devices left over from a previous failed assembly run.
+# (Needed because loop+kpartx state is shared across container restarts.)
+losetup -a 2>/dev/null \
+  | grep -v 'docker-desktop\|docker-wsl-cli' \
+  | awk -F: '{print $1}' \
+  | while read -r _ld; do
+      kpartx -d "$_ld" 2>/dev/null || true
+      losetup -d "$_ld" 2>/dev/null || true
+    done
+
 ################################################################################
 # CLEANUP / TRAP
 ################################################################################
 
+# Track whether guestmount was used (needs guestunmount instead of umount).
+USE_GUESTMOUNT=0
+# Tmpfs copy of HFS+ partition used by guestmount (avoids virtiofs O_DIRECT issue).
+HFS_IMG=""
+
 mr_proper() {
     set +e
+    # Unmount first, then tear down device-mapper/loop (order matters).
+    if mountpoint -q "$MOUNT" 2>/dev/null; then
+        if [ "$USE_GUESTMOUNT" = "1" ]; then
+            guestunmount "$MOUNT" 2>/dev/null || true
+        else
+            umount -f "$MOUNT" 2>/dev/null || fusermount -u "$MOUNT" 2>/dev/null
+        fi
+    fi
     if [ -n "$LOOP_PART" ]; then
         kpartx -d "$LOOP_DEV" >/dev/null 2>&1
-    fi
-    if mountpoint -q "$MOUNT" 2>/dev/null; then
-        umount -f "$MOUNT" 2>/dev/null
     fi
     if [ -n "$LOOP_DEV" ]; then
         losetup -d "$LOOP_DEV" 2>/dev/null
     fi
     rm -f "$ELTORITOISO"
+    rm -f "${HFS_IMG:-}" 2>/dev/null || true
+    # Clean up temporary raw image (used when output is .vmwarevm bundle).
+    [ "${RAW_TARGET:-}" != "${TARGET:-}" ] && rm -f "$RAW_TARGET" 2>/dev/null || true
     rmdir "$MOUNT" 2>/dev/null || true
     set -e
 }
@@ -320,31 +359,7 @@ CDBOOT="cdboot"  # El Torito CD-ROM boot image
 if [ -n "$EXT" ]; then
 
     # ------------------------------------------------------------------
-    # 1. Build El Torito ISO from the bootloader files.
-    # ------------------------------------------------------------------
-    echo "Building El Torito ISO from bootloader files"
-    _ISOWORK=/tmp/i386_pd_$$
-    mkdir -p "$_ISOWORK"
-    cp "$BOOTi386"/* "$_ISOWORK/"
-
-    if [ ! -f "$_ISOWORK/$CDBOOT" ]; then
-        echo "ERROR: $CDBOOT not found in $BOOTi386 — cannot build bootable ISO."
-        rm -rf "$_ISOWORK"
-        exit 1
-    fi
-
-    genisoimage -quiet -V "$VOLNAME" \
-        -no-emul-boot -boot-load-size 4 \
-        -c boot.cat -b "$CDBOOT" \
-        -o "$ELTORITOISO" "$_ISOWORK"
-    rm -rf "$_ISOWORK"
-
-    ISO_BYTES=$(stat -c %s "$ELTORITOISO")
-    sectors=$(( (ISO_BYTES + 511) / 512 ))
-    echo "El Torito ISO: $ELTORITOISO  ($sectors sectors)"
-
-    # ------------------------------------------------------------------
-    # 2. Decide disk image size.
+    # 1. Decide disk image size.
     # ------------------------------------------------------------------
     SIZE="1618"     # MiB — full release
     if [ "$ADD_RELEASE_NANO" = "y" ]; then
@@ -355,92 +370,160 @@ if [ -n "$EXT" ]; then
         fi
     fi
 
+    # HFS+ partition starts at sector 63 (one-cylinder gap, classic PC MBR layout).
+    # This exactly matches the Brain Transplant Edition VMDK (PDXMASNBE01) which
+    # is confirmed to boot on VMware Workstation/Fusion with Chameleon RC4 r684.
+    # Chameleon boot0 reads the LBA start directly from the MBR partition entry
+    # at bytes 446+8 and issues INT 13h to load boot1h from that sector.
+    HFS_START=63
+
+    # ------------------------------------------------------------------
+    # 2. Pre-build libguestfs appliance BEFORE creating any loop devices.
+    # ------------------------------------------------------------------
+    if command -v guestmount >/dev/null 2>&1 && \
+       ! (modprobe hfsplus 2>/dev/null && grep -q hfsplus /proc/filesystems 2>/dev/null); then
+        echo "Pre-building libguestfs appliance (before disk creation)..."
+        _ub_kernel=$(ls /boot/vmlinuz-5.15.0-*-generic 2>/dev/null | sort -V | tail -1)
+        if [ -n "$_ub_kernel" ]; then
+            export LIBGUESTFS_KERNEL="$_ub_kernel"
+        fi
+        rm -rf /var/tmp/.guestfs-0/ 2>/dev/null || true
+        LIBGUESTFS_BACKEND=direct guestfish -a /dev/null run : shutdown 2>/dev/null || true
+        echo "  Appliance pre-built."
+    fi
+
     # ------------------------------------------------------------------
     # 3. Create raw disk image.
     # ------------------------------------------------------------------
-    echo "Creating raw disk image: $TARGET  (${SIZE} MiB)"
-    dd if=/dev/zero of="$TARGET" bs=1M count="$SIZE" status=progress
+    echo "Creating raw disk image: $RAW_TARGET  (${SIZE} MiB)"
+    dd if=/dev/zero of="$RAW_TARGET" bs=1M count="$SIZE" status=progress
 
     # ------------------------------------------------------------------
-    # 4. Partition with Apple Partition Map.
+    # 4. Partition with MBR (msdos) + single HFS+ partition at sector 63.
     #
-    #    Layout (512-byte sectors):
-    #      0          : Driver Descriptor Map (DDM)
-    #      1 – 63     : Apple Partition Map entries (parted creates these)
-    #      64 – N-1   : El Torito ISO content (written directly in step 6)
-    #      N – end    : Apple_HFS partition (HFS+)
+    #    sfdisk is used directly on the raw image file.  The format string
+    #    "start,,type,bootable" maps to: start sector, size (all remaining),
+    #    partition type (0xAF = HFS+), bootable flag (*).
+    #
+    #    This produces a partition table byte-compatible with the Brain
+    #    Transplant Edition VMDK which uses macOS fdisk -a hfs (sector 63,
+    #    type AF, bootable).
     # ------------------------------------------------------------------
-    HFS_START=$(( sectors > 64 ? sectors : 64 ))
-
-    echo "Partitioning: Apple Partition Map, HFS+ at sector $HFS_START"
-    parted -s "$TARGET" mklabel mac
-    # parted auto-creates partition 1 (the APM map itself);
-    # our HFS+ data partition becomes partition 2.
-    parted -s "$TARGET" mkpart "$VOLNAME" hfs+ "${HFS_START}s" 100%
+    echo "Partitioning: MBR, HFS+ at sector $HFS_START"
+    printf '%s\n' "${HFS_START},,af,*" | sfdisk --force "$RAW_TARGET" 2>/dev/null || \
+    printf '%s\n' "${HFS_START},,af,*" | sfdisk "$RAW_TARGET"
 
     # ------------------------------------------------------------------
-    # 5. Attach raw image as a loop device and map its partitions.
+    # 5. Install Chameleon boot0 into MBR bytes 0-439.
+    #
+    #    The MBR sector layout is:
+    #      Bytes   0-439  bootstrap code (boot0)
+    #      Bytes 440-443  disk signature (written by sfdisk, preserved)
+    #      Bytes 444-445  reserved 0x0000 (preserved)
+    #      Bytes 446-509  partition table (written by sfdisk above)
+    #      Bytes 510-511  boot signature 0x55AA (written by sfdisk)
+    #
+    #    Writing exactly 440 bytes of boot0 overwrites only the bootstrap
+    #    code, leaving the partition table and signature intact.
+    #
+    #    Boot chain:
+    #      BIOS → boot0 (bytes 0-439)
+    #             → scans partition table for type-0xAF entry
+    #             → finds HFS+ starting at sector 63
+    #             → INT 13h: loads 512 bytes from sector 63 → boot1h
+    #             → boot1h scans HFS+ catalog for /boot
+    #             → /boot (Chameleon stage 2) loads mach_kernel.voodoo
+    #             → Darwin 9 kernel starts
     # ------------------------------------------------------------------
-    LOOP_DEV=$(losetup -f --show "$TARGET")
-    LOOP_NAME=$(basename "$LOOP_DEV")
-    echo "Loop device: $LOOP_DEV"
-
-    kpartx -av "$LOOP_DEV" >/dev/null
-    LOOP_PART="$LOOP_DEV"
-
-    # Partition 1 = APM map (created by parted automatically)
-    # Partition 2 = our HFS+ volume
-    HFS_PART="/dev/mapper/${LOOP_NAME}p2"
-
-    # Give kpartx a moment to create the device nodes.
-    _retries=0
-    while [ ! -b "$HFS_PART" ] && [ $_retries -lt 10 ]; do
-        sleep 0.5
-        _retries=$(( _retries + 1 ))
-    done
-    if [ ! -b "$HFS_PART" ]; then
-        echo "ERROR: kpartx did not create $HFS_PART (loop device: $LOOP_DEV)"
-        mr_proper
-        exit 1
-    fi
-
-    # ------------------------------------------------------------------
-    # 6. Write boot0 MBR and El Torito ISO payload into the raw device.
-    # ------------------------------------------------------------------
-    echo "Writing boot0 MBR"
-    dd if="$BOOTi386/$BOOT0" of="$LOOP_DEV" bs=512 count=1 conv=notrunc
-
-    echo "Writing El Torito ISO payload starting at sector 64"
-    # We skip the first 64 sectors of the ISO (that's where genisoimage
-    # put the boot catalogue) and write the full ISO at sector 64 of the
-    # raw device so it overlaps with the APM area but is accessible to the
-    # BIOS El Torito loader.
-    dd if="$ELTORITOISO" of="$LOOP_DEV" seek=64 bs=512 conv=notrunc
-    rm -f "$ELTORITOISO"
+    echo "Installing Chameleon boot0 to MBR (440 bytes)..."
+    dd if="$BOOTi386/$BOOT0" of="$RAW_TARGET" bs=440 count=1 conv=notrunc 2>/dev/null
+    echo "boot0 installed."
 
     # ------------------------------------------------------------------
-    # 7. Format HFS+.
+    # 7. Format HFS+ directly into a local tmpfs file.
+    #
+    #    Rationale: writing via a loop device backed by the virtiofs mount
+    #    (RAW_TARGET on the Docker bind-mount) leads to a page-cache
+    #    coherency bug: the guest kernel's block-device cache and virtiofs's
+    #    file cache diverge after sync(), so reads from the block device
+    #    return the original zeros rather than the mkfs-written metadata.
+    #
+    #    By formatting directly into a tmpfs file we stay entirely in the
+    #    guest kernel's page cache — no virtiofs involved — and QEMU (via
+    #    guestmount) can read the fresh HFS+ volume header reliably.
+    #    Afterwards we write the populated image back into RAW_TARGET with a
+    #    plain dd (write-only, no readback from virtiofs).
     # ------------------------------------------------------------------
+    HFS_SIZE=$(( SIZE * 1024 * 1024 - HFS_START * 512 ))
+    HFS_IMG="/tmp/puredarwin_hfs_$$.img"
+    echo "Creating HFS+ partition image in tmpfs: $HFS_IMG  ($HFS_SIZE bytes)"
+    # Sparse truncate: allocates no disk space for the zero-filled regions.
+    truncate -s "$HFS_SIZE" "$HFS_IMG"
+
     if [ "$ADD_HFS_JOURNAL" != "n" ]; then
-        echo "Formatting $HFS_PART as journaled HFS+ ($VOLNAME)"
-        mkfs.hfsplus -J -v "$VOLNAME" "$HFS_PART"
+        echo "Formatting $HFS_IMG as journaled HFS+ ($VOLNAME)"
+        mkfs.hfsplus -J -v "$VOLNAME" "$HFS_IMG"
     else
-        echo "Formatting $HFS_PART as HFS+ ($VOLNAME)"
-        mkfs.hfsplus -v "$VOLNAME" "$HFS_PART"
+        echo "Formatting $HFS_IMG as HFS+ ($VOLNAME)"
+        mkfs.hfsplus -v "$VOLNAME" "$HFS_IMG"
     fi
+    echo "HFS+ magic after mkfs: $(dd if="$HFS_IMG" bs=1 skip=1024 count=2 2>/dev/null | xxd -p) (expect 482b)"
 
     # ------------------------------------------------------------------
-    # 8. Install boot1h to the HFS+ partition boot sector.
+    # 8. Install boot1h to the HFS+ partition boot sector (byte 0 of HFS_IMG).
+    #
+    #    boot1h may span more than one 512-byte sector (Chameleon RC4's
+    #    boot1h is 1024 bytes = 2 sectors).  boot0 loads only the first
+    #    sector and jumps to it; that first sector then re-loads the
+    #    remainder from disk.  We must write all sectors of boot1h so
+    #    the self-loader finds the correct code at sector 1 of the
+    #    HFS+ partition rather than HFS+ metadata zeros.
+    #    HFS+ reserves the first 1024 bytes (sectors 0-1) as "boot blocks"
+    #    (normally empty); overwriting them with boot1h is safe.
     # ------------------------------------------------------------------
-    echo "Installing boot1h to HFS+ partition boot sector"
-    dd if="$BOOTi386/$BOOT1H" of="$HFS_PART" bs=512 count=1 conv=notrunc
+    _boot1h_sectors=$(( ( $(stat -c '%s' "$BOOTi386/$BOOT1H") + 511 ) / 512 ))
+    echo "Installing boot1h to HFS+ partition boot sector ($_boot1h_sectors sector(s))"
+    dd if="$BOOTi386/$BOOT1H" of="$HFS_IMG" bs=512 count="$_boot1h_sectors" conv=notrunc
+
+    # HFS_IMG is already on tmpfs (formatted directly above).  No sync needed
+    # for virtiofs because the loop device was detached before mkfs.
 
     # ------------------------------------------------------------------
     # 9. Mount HFS+ and begin populating.
+    #    Try in order: kernel driver → hfsfuse (FUSE, read-only warning) →
+    #    guestmount (libguestfs/QEMU appliance, writable, no kernel needed).
     # ------------------------------------------------------------------
     mkdir -p "$MOUNT"
-    mount -t hfsplus "$HFS_PART" "$MOUNT"
-    echo "Mounted $HFS_PART on $MOUNT"
+    if mount -t hfsplus "$HFS_IMG" "$MOUNT" 2>/dev/null; then
+        echo "Mounted $HFS_IMG on $MOUNT (kernel hfsplus)"
+    elif command -v guestmount >/dev/null 2>&1; then
+        echo "Kernel hfsplus unavailable — mounting via guestmount (libguestfs/QEMU)"
+        echo "Note: without KVM this may be slow, but is fully writable."
+        # Force libguestfs to use the INSTALLED Ubuntu kernel (has CONFIG_HFSPLUS_FS=m),
+        # NOT the running WSL2 kernel which lacks HFS+ support.
+        _ub_kernel=$(ls /boot/vmlinuz-5.15.0-*-generic 2>/dev/null | sort -V | tail -1)
+        if [ -n "$_ub_kernel" ]; then
+            echo "  Using kernel: $_ub_kernel"
+            export LIBGUESTFS_KERNEL="$_ub_kernel"
+        fi
+        # HFS_IMG is a local tmpfs file (formatted by mkfs.hfsplus above).
+        # QEMU opens it with buffered I/O (no O_DIRECT for regular files), so it
+        # reads the fresh HFS+ metadata directly from the page cache.
+        # "rw,force" is required: hfsplus defaults to read-only and force is
+        # needed when the journal appears dirty (expected for a newly-formatted vol).
+        echo "  HFS+ check: $(dd if="$HFS_IMG" bs=1 skip=1024 count=2 2>/dev/null | xxd -p) (expect 482b)"
+        LIBGUESTFS_BACKEND=direct guestmount --rw -a "$HFS_IMG" -m "/dev/sda:/:rw,force:hfsplus" "$MOUNT"
+        USE_GUESTMOUNT=1
+        echo "Mounted HFS+ partition via guestmount on $MOUNT"
+    elif command -v hfsfuse >/dev/null 2>&1; then
+        echo "WARNING: hfsfuse is read-only — population will fail."
+        echo "         Install libguestfs-tools for writable HFS+ support."
+        hfsfuse -o allow_other "$HFS_IMG" "$MOUNT"
+    else
+        echo "ERROR: Cannot mount HFS+. Install libguestfs-tools in the Docker image."
+        mr_proper
+        exit 1
+    fi
 
     # Copy stage-2 Chameleon loader to the volume root.
     echo "Installing stage-2 loader (boot) to volume root"
@@ -541,11 +624,12 @@ else
         echo " * VMware-Drivers-OpenSource.zip"
         unzip -q "$DIRNAME/pd_setup_files/VMware-Drivers-OpenSource.zip" \
             -d "$MOUNT/System/Library/Extensions"
-        if [ "$ADD_X" = "y" ]; then
-            echo " * VMwareIOFramebuffer.kext.zip"
-            unzip -q "$DIRNAME/pd_setup_files/VMwareIOFramebuffer.kext.zip" \
-                -d "$MOUNT/System/Library/Extensions"
-        fi
+        # VMwareIOFramebuffer.kext switches the Darwin console to the VMware
+        # SVGA2 framebuffer which renders as a black screen on VMware
+        # Workstation Pro (EFI SVGA and legacy VESA interact badly).
+        # Leave it out so Darwin falls back to the VGA text console that
+        # Chameleon sets up, which IS visible in the VMware window.
+        # Re-enable once we confirm basic boot works.
     fi
 
     if [ "$ADD_PUREFOUNDATION" != "n" ]; then
@@ -733,7 +817,8 @@ fi
 ################################################################################
 
 echo "Fixing minor errors"
-touch "$MOUNT/private/var/run/resolv.conf"
+mkdir -p "$MOUNT/private/var/run"
+touch "$MOUNT/private/var/run/resolv.conf" 2>/dev/null || true
 
 ################################################################################
 # DEBUG
@@ -948,7 +1033,7 @@ if [ "$ADD_LAUNCHD" = "n" ]; then
     chmod 755    "$MOUNT/sbin/launchd"
 else
     [ "$ADD_LAUNCHD_GETTY"        = "n" ] && rm -f "$MOUNT/System/Library/LaunchDaemons/com.apple.getty.plist"
-    [ "$ADD_LAUNCHD_MDNSRESPONDER"= "n" ] && {
+    [ "$ADD_LAUNCHD_MDNSRESPONDER" = "n" ] && {
         rm -f "$MOUNT/System/Library/LaunchDaemons/com.apple.mDNSResponder.plist"
         rm -f "$MOUNT/System/Library/LaunchDaemons/com.apple.mDNSResponderHelper.plist"
     }
@@ -1027,8 +1112,24 @@ mkdir -p "$MOUNT/System/Library/Caches/com.apple.kernelcaches"
 ################################################################################
 
 echo "Unmounting $MOUNT ..."
-umount "$MOUNT"
+if [ "$USE_GUESTMOUNT" = "1" ]; then
+    guestunmount "$MOUNT"
+else
+    umount "$MOUNT"
+fi
 rmdir  "$MOUNT"
+
+# If we extracted the HFS+ partition to a tmpfs file for guestmount, write it
+# back into the raw disk image at the correct offset before detaching loop.
+if [ -n "$HFS_IMG" ] && [ -f "$HFS_IMG" ]; then
+    echo "Writing populated HFS+ partition back to raw image (at sector $HFS_START)..."
+    # Use seek_bytes so we can use a large block size regardless of HFS_START alignment.
+    # bs=512 would require 3M+ syscalls to virtiofs, taking many minutes; bs=1M takes ~10s.
+    dd if="$HFS_IMG" of="$RAW_TARGET" bs=1M oflag=seek_bytes seek=$(( HFS_START * 512 )) conv=notrunc
+    /bin/sync
+    rm -f "$HFS_IMG"
+    HFS_IMG=""
+fi
 
 kpartx -d "$LOOP_DEV" >/dev/null 2>&1 || true
 sleep 1
@@ -1088,20 +1189,30 @@ case $T_EXT in
     _vmdk="${_name}.vmdk"
     _vmx="${_name}.vmx"
 
-    mv "$TARGET" "$_iso"
-    mkdir -p "$TARGET"
-    mv "$_iso" "$TARGET/$_iso"
+    # On Docker/WSL2 volume mounts (Windows filesystems), 'mv' of large files
+    # corrupts the kernel's VFS cache of the file, making it unreadable.
+    # Work entirely in /tmp (a native Linux tmpfs) to avoid this:
+    #   1. Convert the raw image to VMDK while it is still accessible.
+    #   2. Build the bundle in /tmp.
+    #   3. Recreate the output directory on the volume mount and copy in.
+    _tmp_work="/tmp/pd_vmwarevm_$$"
+    rm -rf "$_tmp_work"
+    mkdir -p "$_tmp_work"
 
     if [ "$ADD_VMWARE_VMDK" != "n" ]; then
         echo "Converting to VMware VMDK..."
-        "$QEMUIMG_BIN" convert -O vmdk "$TARGET/$_iso" "$TARGET/$_vmdk"
+        # Use system qemu-img; the macOS binary in pd_setup_files won't run on Linux.
+        _qemu_sys=$(command -v qemu-img 2>/dev/null || true)
+        _qemu_bin=${_qemu_sys:-"$QEMUIMG_BIN"}
+        "$_qemu_bin" convert -O vmdk "$RAW_TARGET" "$_tmp_work/$_vmdk"
     fi
 
     _date=$(date +"%y%m%d%H%M")
-    cat > "$TARGET/$_vmx" <<VMX
+    cat > "$_tmp_work/$_vmx" <<VMX
 .encoding = "UTF-8"
 bios.bootDelay = "5000"
 config.version = "8"
+firmware = "bios"
 displayName = "${_date} ${DARWIN_RELEASE} / ${ARCH} / $PUREDARWIN_RELEASE"
 ehci.present = "TRUE"
 ethernet0.linkStatePropagation.enable = "FALSE"
@@ -1115,12 +1226,9 @@ ich7m.present = "TRUE"
 ide0:0.fileName = "$_vmdk"
 ide0:0.present = "TRUE"
 ide0:0.redo = ""
-ide1:0.autodetect = "TRUE"
-ide1:0.deviceType = "cdrom-image"
-ide1:0.fileName = "$_iso"
-ide1:0.present = "TRUE"
+ide1:0.present = "FALSE"
 keyboardAndMouseProfile = "macProfile"
-memsize = "128"
+memsize = "256"
 nvram = "${_name}.nvram"
 pciBridge0.present = "TRUE"
 pciBridge4.functions = "8"
@@ -1145,9 +1253,11 @@ scsi0.present = "TRUE"
 scsi0.virtualDev = "lsilogic"
 scsi0:0.fileName = ""
 scsi0:0.present = "FALSE"
-serial0.fileType = "thinprint"
-serial0.present = "FALSE"
-smc.present = "TRUE"
+serial0.fileType = "file"
+serial0.fileName = "${_name}.serial.log"
+serial0.present = "TRUE"
+serial0.tryNoRxLoss = "FALSE"
+smc.present = "FALSE"
 tools.syncTime = "TRUE"
 tools.upgrade.policy = "upgradeAtPowerCycle"
 usb.generic.autoconnect = "FALSE"
@@ -1158,13 +1268,35 @@ vmci0.present = "TRUE"
 VMX
 
     if [ "$ADD_VMWARE_IDE_DRIVE" = "y" ] && [ -n "$QEMUIMG_BIN" ]; then
-        "$QEMUIMG_BIN" create -f vmdk "$TARGET/second.vmdk" 2048M
-        cat >> "$TARGET/$_vmx" <<VMX
+        "$QEMUIMG_BIN" create -f vmdk "$_tmp_work/second.vmdk" 2048M
+        cat >> "$_tmp_work/$_vmx" <<VMX
 ide0:1.present = "TRUE"
 ide0:1.fileName = "second.vmdk"
 ide0:1.redo = ""
 VMX
     fi
+
+    # Also include the raw disk image as .iso inside the bundle.
+    # Copy from RAW_TARGET (in /tmp) to the bundle — no mv needed.
+    # Skip if /tmp doesn't have enough space (1.6 GB); the VM still boots from VMDK.
+    if [ "$ADD_VMWARE_ISO_IN_BUNDLE" = "y" ]; then
+        cp "$RAW_TARGET" "$_tmp_work/$_iso" 2>/dev/null || \
+            echo "NOTE: Raw ISO not included in bundle (insufficient /tmp space)."
+    fi
+    rm -f "$RAW_TARGET" 2>/dev/null || true
+
+    # Create the final bundle directory on the volume mount and copy in.
+    # Note: on Docker/WSL2 volume mounts puredarwin.vmwarevm may appear as a
+    # ghost directory (EISDIR) that blocks mkdir but allows cp-into-dir via
+    # openat(dirfd).  Use "cp -r src/. dest/" which uses openat and bypasses
+    # the path-resolution failure.
+    cp -r "$_tmp_work/." "$TARGET/" 2>/dev/null || {
+        # Fallback: try mkdir then individual copies.
+        mkdir -p "$TARGET" 2>/dev/null || true
+        cp "$_tmp_work/$_vmdk" "$TARGET/$_vmdk" 2>/dev/null || true
+        cp "$_tmp_work/$_vmx"  "$TARGET/$_vmx"  2>/dev/null || true
+    }
+    rm -rf "$_tmp_work"
 
     chmod -R 777 "$TARGET"
     chown -R 501:staff "$TARGET" 2>/dev/null || true

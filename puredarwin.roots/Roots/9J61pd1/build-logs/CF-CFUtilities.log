@@ -1,0 +1,5 @@
+In file included from /repo/source/apple/CF/./CFUtilities.c:28:
+/repo/source/apple/CF/CFPriv.h:34:10: fatal error: 'string.h' file not found
+#include <string.h>
+         ^~~~~~~~~~
+1 error generated.

@@ -6,5 +6,9 @@
 	<string>mach_kernel</string>
 	<key>Kernel Flags</key>
 	<string>-v cpus=1</string>
+	<key>Timeout</key>
+	<string>0</string>
+	<key>GUI</key>
+	<string>No</string>
 </dict>
 </plist>

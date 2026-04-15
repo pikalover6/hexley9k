@@ -1,0 +1,5 @@
+In file included from /repo/source/apple/CF/./CFSystemDirectories.c:35:
+/tmp/pd_build_linux_7/CF/objects/CoreFoundation/CFPriv.h:34:10: fatal error: 'string.h' file not found
+#include <string.h>
+         ^~~~~~~~~~
+1 error generated.

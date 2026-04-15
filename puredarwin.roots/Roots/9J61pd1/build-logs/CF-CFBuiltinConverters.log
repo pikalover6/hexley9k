@@ -1,0 +1,8 @@
+In file included from /repo/source/apple/CF/./CFBuiltinConverters.c:28:
+In file included from /repo/source/apple/CF/CFStringEncodingConverterExt.h:30:
+In file included from /tmp/pd_build_linux_7/CF/objects/CoreFoundation/CFStringEncodingConverter.h:30:
+In file included from /tmp/pd_build_linux_7/CF/objects/CoreFoundation/CFString.h:30:
+/tmp/pd_build_linux_7/CF/objects/CoreFoundation/CFBase.h:63:10: fatal error: 'AvailabilityMacros.h' file not found
+#include <AvailabilityMacros.h>
+         ^~~~~~~~~~~~~~~~~~~~~~
+1 error generated.

@@ -1,0 +1,6 @@
+In file included from /repo/source/apple/CF/./CFStorage.c:36:
+In file included from /repo/source/apple/CF/CFStorage.h:52:
+/tmp/pd_build_linux_7/CF/objects/CoreFoundation/CFBase.h:63:10: fatal error: 'AvailabilityMacros.h' file not found
+#include <AvailabilityMacros.h>
+         ^~~~~~~~~~~~~~~~~~~~~~
+1 error generated.
