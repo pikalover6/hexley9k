@@ -260,6 +260,8 @@ sudo ./pd_setup puredarwin.vmwarevm PureDarwin
 
 `pd_setup` creates a zeroed raw image, partitions it as Apple Partition Map, formats HFS+J, deploys the binary roots, blesses the volume, creates a `toor` user, rebuilds the kext cache, and converts to VMDK.
 
+For modern VMware versions, generated `.vmx` files now force legacy BIOS boot (`firmware = "bios"`), prefer HDD boot order, and avoid auto-attaching the raw `.iso` as a bootable CD when a `.vmdk` is present. This avoids getting stuck at the Chameleon screen on recent VMware releases.
+
 | Output path | Format |
 |-------------|--------|
 | `foo.vmwarevm` | VMware virtual machine bundle (`.vmx` + `.vmdk`) |

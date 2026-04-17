@@ -1211,6 +1211,7 @@ case $T_EXT in
     cat > "$_tmp_work/$_vmx" <<VMX
 .encoding = "UTF-8"
 bios.bootDelay = "5000"
+bios.bootOrder = "hdd"
 config.version = "8"
 firmware = "bios"
 displayName = "${_date} ${DARWIN_RELEASE} / ${ARCH} / $PUREDARWIN_RELEASE"
